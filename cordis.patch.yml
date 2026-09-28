@@ -1,0 +1,7 @@
+# dsh-activity-monitor bundle patch：一条 host 半身行，插进 profile 的插件树。
+# 行名由包管理器在 profile 目录里解析（`dsh plugin --profile web add <path>` 装好之后）。
+# 浏览器半身（dsh.client + exports["./client"]）由 @deepseek-ai/dsh-client-modules
+# 扫描这一行所属包的 package.json 自动挂载，无需在这里登记。
+- insert:
+    - id: activity-monitor
+      name: dsh-activity-monitor

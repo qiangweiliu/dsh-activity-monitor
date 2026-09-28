@@ -1,0 +1,10 @@
+node_modules/
+/lib/
+*.tsbuildinfo
+
+# 本地工具运行态（Proofrail 审计日志等），不入库
+/.proofrail/
+
+# 编辑器/系统噪声
+.DS_Store
+*.log

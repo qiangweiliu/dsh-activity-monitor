@@ -35,9 +35,19 @@ function* fakeStream() {
 const messages = [
   { role: 'system', content: [{ type: 'text', text: 'You are an AI agent powered by DeepSeek Harness.\n\n## 额外行为守则\n- 保持简洁。\n\n当前时间：2026-09-28' }] },
   { role: 'user', content: [{ type: 'text', text: '帮我看看当前目录有什么文件' }] },
-  { role: 'assistant', content: [{ type: 'text', text: '上一轮回复' }] },
+  { role: 'assistant', content: [
+    { type: 'reasoning', text: '先看目录结构，再决定要不要读文件。' },
+    { type: 'text', text: '我先列一下目录。' },
+    { type: 'tool-call', id: 'call-1', name: 'bash', arguments: '{"command":"ls -la"}' },
+  ] },
+  { role: 'user', content: [{ type: 'tool-result', toolCallId: 'call-1', content: [{ type: 'text', text: 'total 12\n-rw-r--r-- 1 wu wu 512 package.json' }] }] },
 ]
-const options = { provider: 'deepseek', model: 'v3.2', messages, tools: [{}, {}, {}] }
+const options = { provider: 'deepseek', model: 'v3.2', messages, tools: [
+  { name: 'bash', description: '在持久 shell 里执行命令' },
+  { name: 'read', description: '读取文件内容' },
+  { name: 'write', description: '写入文件' },
+] }
+
 
 // 等待后台 assembly 缓存刷新（2 秒周期）
 await new Promise((r) => setTimeout(r, 2600))
@@ -55,6 +65,7 @@ const snap = JSON.parse(fakeRes.body)
 console.log('rows:', snap.total)
 for (const row of snap.rows) {
   console.log(`  [${row.tag}] ${row.name} → ${row.summary}`)
+  if (row.calls) console.log('  本轮调用位置:', JSON.stringify(row.calls))
   console.log('  sections:', (row.sections ?? []).map((s: any) => s.title))
   const sysSections = (row.sections ?? []).filter((s: any) => s.title.startsWith('段落'))
   if (sysSections.length > 0) {
