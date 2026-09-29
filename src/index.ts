@@ -40,6 +40,8 @@ export interface ActivitySection {
   isGroup?: boolean
   /** 所属分组标题的 key（配合 isGroup 使用） */
   parent?: string
+  /** 正文里各消息块在 body 中的起始偏移（渲染时按它切分，供组内按「第 n 条消息」跳转定位；正文本身不加标记） */
+  anchorOffsets?: number[]
 }
 
 /** 单条活动记录 */
@@ -558,28 +560,24 @@ function blockText(b: any): string {
   }
 }
 
-/** 一条请求消息 → 角色标签 + 全文（reasoning 抽出来单独成段，默认折叠） */
-function messagePart(m: any, i: number, callNames: Map<string, string>): { i: number; label: string; text: string; reasoning: string } {
-  const role = String(m?.role ?? '?')
+/** 一条请求消息 → 全文（reasoning 单独抽出；完整上下文正文里不加任何角色小标签） */
+function messagePart(m: any, i: number, callNames: Map<string, string>): { i: number; text: string; reasoning: string } {
+  void i
   const blocks = Array.isArray(m?.content) ? m.content : [{ type: 'text', text: m?.content ?? '' }]
   const pieces: string[] = []
   const reason: string[] = []
-  const calls: string[] = []
-  let isToolResult = false
   let toolName: string | undefined = m?.source?.toolName ?? m?.name ?? undefined
 
   for (const b of blocks) {
     if (b?.type === 'tool-call') {
-      calls.push(String(b.name ?? '?'))
       if (!toolName) toolName = String(b.name ?? '')
       pieces.push(blockText(b))
     } else if (b?.type === 'tool-result') {
-      isToolResult = true
       // 工具名回填：tool 结果消息只带 toolCallId，名称来自前面那条 assistant 的 tool-call
       if (!toolName && b.toolCallId) toolName = callNames.get(String(b.toolCallId))
       pieces.push(blockText(b))
     } else if (b?.type === 'reasoning') {
-      // 推理内容单独成段（保留全文，但界面默认折叠）
+      // 推理内容单独抽出（保留全文，正文按「思考在前、回复在后」排开）
       const t = String(b.text ?? '')
       if (t.trim() !== '') reason.push(t)
     } else {
@@ -591,25 +589,17 @@ function messagePart(m: any, i: number, callNames: Map<string, string>): { i: nu
   if (Array.isArray(m?.tool_calls)) {
     for (const c of m.tool_calls) {
       const n = c?.function?.name ?? c?.name ?? '?'
-      calls.push(String(n))
       if (!toolName) toolName = String(n)
       pieces.push(`→ 调用工具 ${n}(${String(c?.function?.arguments ?? c?.arguments ?? '')})`)
     }
   }
   for (const key of ['tool_call_id', 'toolCallId']) {
     if (m?.[key]) {
-      isToolResult = true
       if (!toolName) toolName = callNames.get(String(m[key]))
     }
   }
 
-  let label: string
-  if (role === 'system') label = `[${i}] [system]`
-  else if (isToolResult) label = `[${i}] [tool 结果${toolName ? ` ← ${toolName}` : ''}]`
-  else if (calls.length > 0) label = `[${i}] [assistant → 工具调用 ${calls.join(', ')}]`
-  else label = `[${i}] [${role}]`
-
-  return { i, label, text: pieces.join('\n'), reasoning: reason.join('\n') }
+  return { i, text: pieces.join('\n'), reasoning: reason.join('\n') }
 }
 
 /**
@@ -651,9 +641,12 @@ function collectToolCalls(messages: any[]): { name: string; msgIndex: number; ca
 }
 
 /**
- * 组装两个分组：「完整上下文（N 条消息）」与「工具清单（N 个 · 只列名）」。
- * 消息共享 CONTEXT_BUDGET_BYTES 预算，按「最新 → 最旧」分配，装不下的整条省略并标注；
- * 工具清单只保留名字（不再保留 schema），因此不占预算、也不去重。
+ * 组装「完整上下文」分组：里面只放一条正文 = 真正发给模型的完整消息序列原文（含思考、
+ * 工具调用、工具结果，全文不截断；超预算仍按「最旧优先」整条省略并标注，尾部才是生效上下文）。
+ * 不再拆成「每条消息一个分段 + 标题上的 [n] [角色] 小标签」，也不再另列「工具清单」——
+ * 完整显示本身就是目的，小标签是多余的。
+ * 组内跳转（工具行 → 某条消息）靠分组段的 anchorOffsets：前端把正文按消息块切分渲染，
+ * 每块带 data-am-msg 属性可定位；偏移在宿主侧算好，正文本身不加任何标记字符。
  */
 function buildContextSections(messages: any[], tools: any[]): {
   sections: ActivitySection[]
@@ -692,55 +685,43 @@ function buildContextSections(messages: any[], tools: any[]): {
   }
   const contextBytes = used
 
-  const sections: ActivitySection[] = []
-  if (parts.length > 0) {
-    sections.push({
-      title: `完整上下文（${parts.length} 条消息 · ${fmtBytes(contextBytes)}`
-        + `${omitted ? ` · ${omitted} 条因超 ${fmtBytes(CONTEXT_BUDGET_BYTES)} 预算已省略` : ''}）`,
-      body: '',
-      key: 'group:context',
-      isGroup: true,
-    })
-    for (const p of parts) {
-      const cut = p.text === '' && p.reasoning === ''
-      // 推理内容单独成段：排在对应消息之前（原文顺序是先想再答），保留全文但默认折叠
-      if (p.reasoning !== '') {
-        sections.push({
-          title: `${p.label} [思考]（${p.reasoning.length} 字）`,
-          body: p.reasoning,
-          key: `think:${p.i}`,
-          parent: 'group:context',
-        })
-      }
-      sections.push({
-        title: cut
-          ? `${p.label}（超出预算，已省略）`
-          : (p.text === '' ? `${p.label}（本条只有推理内容）` : `${p.label}  ${firstLine(p.text)}`),
-        body: p.text,
-        key: `msg:${p.i}`,
-        parent: 'group:context',
-      })
+  // 拼成一篇完整正文：推理 → 正文按原顺序逐条排开，块与块之间一个空行。
+  // 被预算整条省略的条目保留一行占位（标注序号），序列仍是完整的。
+  // anchorOffsets[i] = 第 i 条消息块在正文里的起始偏移（渲染时按它切分成可定位的元素）。
+  const blocks: string[] = []
+  for (const p of parts) {
+    if (p.text !== '' || p.reasoning !== '') {
+      blocks.push((p.reasoning !== '' ? `${p.reasoning}\n` : '') + (p.text !== '' ? p.text : ''))
+    } else {
+      blocks.push(`（消息 ${p.i}：超出预算，已省略）`)
     }
   }
-  // 工具清单：只保留工具名，不再保留 schema（每步体积从 ~136KB 降到名称本身）。
-  // 工具名不去重 —— 重名条目按出现次数原样逐条列出，key 用下标保证唯一。
-  const toolNames = (tools ?? []).map((t: any, i: number) => {
-    if (typeof t === 'string') return { i, name: t }
+  const anchorOffsets: number[] = []
+  let off = 0
+  for (let i = 0; i < blocks.length; i++) {
+    anchorOffsets.push(off)
+    off += blocks[i].length + 2 // 块间空行（join 的 '\n' + 空行）
+  }
+  const fullText = blocks.join('\n\n')
+
+  // 工具清单不再单独成组：工具名在消息序列的工具调用块里可见，单独列一遍是冗余的小标签。
+  const toolNames = (tools ?? []).map((t: any) => {
+    if (typeof t === 'string') return t
     const fn = t?.function ?? t
-    return { i, name: String(fn?.name ?? t?.name ?? '?') }
+    return String(fn?.name ?? t?.name ?? '?')
   })
-  const toolBytes = toolNames.reduce((n, t) => n + byteLen(t.name) + 1, 0)
-  if (toolNames.length > 0) {
-    sections.push({
-      title: `工具清单（${toolNames.length} 个 · 名称共 ${fmtBytes(toolBytes)}）`,
-      body: '',
-      key: 'group:tools',
-      isGroup: true,
-    })
-    for (const t of toolNames) {
-      sections.push({ title: t.name, body: '', key: `tool:${t.i}:${t.name}`, parent: 'group:tools' })
-    }
-  }
+  const toolBytes = toolNames.reduce((n, s) => n + byteLen(s) + 1, 0)
+
+  const sections: ActivitySection[] = []
+  sections.push({
+    title: `完整上下文（${parts.length} 条消息 · ${fmtBytes(contextBytes)}`
+      + `${omitted ? ` · ${omitted} 条因超 ${fmtBytes(CONTEXT_BUDGET_BYTES)} 预算已省略` : ''}`
+      + ` · 工具 ${toolNames.length} 个 ${fmtBytes(toolBytes)}）`,
+    body: fullText,
+    key: 'group:context',
+    isGroup: true,
+    anchorOffsets,
+  })
   return {
     sections,
     contextBytes,

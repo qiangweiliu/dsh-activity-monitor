@@ -49,6 +49,8 @@ interface Section {
   key?: string
   isGroup?: boolean
   parent?: string
+  /** 正文里各消息块的起始偏移（宿主算好）：渲染时按它把正文切成可定位的块，块带 data-am-msg */
+  anchorOffsets?: number[]
 }
 
 // ── 简易外部 store（useSyncExternalStore）──
@@ -115,13 +117,12 @@ function callLocations(all: Row[]): Map<number, CallLoc> {
 function jumpToContext(loc: CallLoc): void {
   expanded.add(loc.rowSeq)
   expandedSecs.add(`${loc.rowSeq}:group:context`)
-  expandedSecs.add(`${loc.rowSeq}:msg:${loc.msgIndex}`)
-  if (loc.resultMsgIndex != null) expandedSecs.add(`${loc.rowSeq}:msg:${loc.resultMsgIndex}`)
   notify()
   setTimeout(() => {
-    const el = document.querySelector(`[data-am-sec="${loc.rowSeq}:msg:${loc.msgIndex}"]`)
+    // 后代选择器（中间空格）：data-am-row 在外层容器、data-am-msg 在其内部的消息块 pre 上
+    const el = document.querySelector(`[data-am-row="${loc.rowSeq}"] [data-am-msg="${loc.msgIndex}"]`)
     if (el && typeof (el as any).scrollIntoView === 'function') {
-      (el as any).scrollIntoView({ block: 'center', behavior: 'smooth' })
+      ;(el as any).scrollIntoView({ block: 'center', behavior: 'smooth' })
     }
   }, 120)
 }
@@ -517,7 +518,7 @@ function ActivityRowView({ row, step, stepColor, loc, stepOf }: {
     // 展开区：llm 行渲染分段（用户消息/助手回复/提示词段落），tool 行渲染单块 detail
     // 提示词分段（sec.key 存在的）是二级折叠：点击段落标题单独展开正文
     // 配色口径：提示词/对话 = 冷色系（段落靛蓝、对话青），工具参数与结果 = 暖色系（琥珀）
-    isOpen && row.sections && row.sections.length > 0 && h('div', { style: { margin: '0 12px 8px 40px' } },
+    isOpen && row.sections && row.sections.length > 0 && h('div', { 'data-am-row': String(row.seq), style: { margin: '0 12px 8px 40px' } },
       row.sections.map((sec, i) => {
         // 用 key 做折叠标识（分组子段要能按 parent 找到自己所属分组的开关）
         const secId = sec.key ? `${row.seq}:${sec.key}` : `${row.seq}:${i}`
@@ -569,18 +570,34 @@ function ActivityRowView({ row, step, stepColor, loc, stepOf }: {
               style: { fontWeight: 400, color: 'var(--dsw-alias-label-secondary, #4b5563)' },
             }, '  ' + pv),
           ),
-          bodyOpen && h('pre', {
-            style: {
-              margin: 0, padding: 8, fontSize: 11, lineHeight: 1.5,
-              background: overlay(bs.soft, 'var(--dsw-alias-bg-layer-2)'),
-              borderRadius: clickable ? '0 0 4px 4px' : 4,
-              color: 'var(--dsw-alias-label-primary)',
-              border: `1px solid ${bs.border}`,
-              borderTop: 'none',
-              borderLeft: `3px solid ${bs.border}`,
-              overflow: 'auto', maxHeight: 220, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
-            },
-          }, sec.body),
+          bodyOpen && (sec.anchorOffsets && sec.anchorOffsets.length > 0
+            ? sec.anchorOffsets.map((o, k) => {
+                const end = k + 1 < sec.anchorOffsets!.length ? sec.anchorOffsets![k + 1] : sec.body.length
+                const text = sec.body.slice(o, end).replace(/\n\n$/, '')
+                return h('pre', {
+                  key: k,
+                  'data-am-msg': k,
+                  style: {
+                    margin: 0,
+                    marginBottom: k + 1 < sec.anchorOffsets!.length ? 12 : 0,
+                    fontSize: 11, lineHeight: 1.5,
+                    color: 'var(--dsw-alias-label-primary)',
+                    whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                  },
+                }, text)
+              })
+            : h('pre', {
+              style: {
+                margin: 0, padding: 8, fontSize: 11, lineHeight: 1.5,
+                background: overlay(bs.soft, 'var(--dsw-alias-bg-layer-2)'),
+                borderRadius: clickable ? '0 0 4px 4px' : 4,
+                color: 'var(--dsw-alias-label-primary)',
+                border: `1px solid ${bs.border}`,
+                borderTop: 'none',
+                borderLeft: `3px solid ${bs.border}`,
+                overflow: 'auto', maxHeight: 220, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+              },
+            }, sec.body)),
         )
       }),
     ),
