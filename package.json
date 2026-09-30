@@ -29,7 +29,7 @@
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\"",
     "build": "tsc && node build-client.mjs",
-    "test": "npm run build && node lib/smoke.js && node lib/smoke-llm.js"
+    "test": "npm run build && node lib/smoke.js && node lib/smoke-llm.js && node lib/smoke-tools.js"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.2 <5.0.0",

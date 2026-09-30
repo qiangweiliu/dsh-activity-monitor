@@ -40,6 +40,20 @@ interface Row {
   turnEnd?: boolean
   durationMs?: number
   ok?: boolean
+  /** 缺省/true = 已结束；false = 该行还在进行中（模型生成中 / 工具执行中） */
+  settled?: boolean
+  /** 行版本：宿主侧「进行中 → 定稿」原地刷新时递增；前端靠它判断该行是否真的变了 */
+  rev?: number
+  // ── 数值化字段（宿主随快照一并下发；面板将来可直接渲染 token/上下文压力，当前仅补齐类型） ──
+  /** 原始 token 用量（llm 行；provider 未回报则缺省） */
+  usageIn?: number
+  usageOut?: number
+  /** 发给模型的上下文规模（llm 行） */
+  contextBytes?: number
+  contextMessages?: number
+  toolBytes?: number
+  /** 该请求因超预算被整条省略的消息数（>0 = 模型没看到完整上下文） */
+  contextOmitted?: number
 }
 
 /** 详情分段：isGroup 的段是分组标题，parent 指向它的段是分组子段（缩进 + 整组默认收起） */
@@ -57,6 +71,8 @@ interface Section {
 let rows: Row[] = []
 /** 行级折叠：展开了详情的行（存行的 seq —— 同一会话内唯一） */
 let expanded = new Set<number>()
+/** 手动收起过的「进行中」行：进行中行默认自动展开看流式输出，用户点掉才记这里；定稿后不再自动展开 */
+let collapsedInFlight = new Set<number>()
 /** 轮次折叠：展开了的轮次分组 key（默认收起，轮次是最大一级折叠标签） */
 const expandedTurns = new Set<string>()
 let paused = false
@@ -66,7 +82,6 @@ const listeners = new Set<() => void>()
 const notify = () => listeners.forEach((l) => l())
 const subscribe = (l: () => void) => { listeners.add(l); return () => { listeners.delete(l) } }
 
-let pollTimer: number | undefined
 /**
  * 面板绑定的会话 = dsh 客户端 sessions 服务的当前选中会话。
  * 切换会话 → 面板切到该会话的监控数据；切换模型不属于会话变化，不影响这里。
@@ -144,7 +159,8 @@ const rowKey = (r: Row): string => `${r.seq}:${r.ts}`
 
 /**
  * 按 seq+ts 去重合并，时间正序，最多留 800 行。
- * 返回是否真的产生了变化 —— 轮询每秒都会把尾部行带回来一次，
+ * 变化判断：新行（首次见到）、宿主侧「进行中 → 定稿」的原地刷新（seq/ts 不变、rev 递增），
+ * 以及轮次边界标记（turnEnd）事后补齐的三种都算。
  * 没变化就不该 notify()，否则面板每秒白重渲染一次（还会把用户的滚动位置拽走）。
  */
 function mergeRows(incoming: Row[]): boolean {
@@ -154,13 +170,16 @@ function mergeRows(incoming: Row[]): boolean {
   let changed = false
   const merged = new Map(known)
   for (const r of incoming) {
-    const prev = known.get(rowKey(r))
-    // 新行，或已有行被更新（durationMs / ok / turnEnd / summary 都是事后补齐的）
-    if (!prev || prev.turnEnd !== r.turnEnd || prev.durationMs !== r.durationMs
-      || prev.ok !== r.ok || prev.summary !== r.summary || prev.detail !== r.detail) {
+    const k = rowKey(r)
+    const prev = known.get(k)
+    const newer = !prev
+      || (r.rev ?? 0) > (prev.rev ?? 0)
+      || (prev.turnEnd !== r.turnEnd || prev.turnStart !== r.turnStart)
+    // 新行 / 刷新行 / 边界标记变化：更新并通知
+    if (newer) {
       changed = true
+      merged.set(k, r)
     }
-    merged.set(rowKey(r), r)
   }
   if (!changed) return false
   rows = [...merged.values()].sort((a, b) => (a.ts - b.ts) || (a.seq - b.seq)).slice(-800)
@@ -179,6 +198,14 @@ async function loadHistory(sessionId: string): Promise<void> {
   } catch { /* 无历史时静默 */ }
 }
 
+/** 会话切换时清掉本会话的展开/收起状态（含「进行中」行的手动收起记录） */
+function clearSessionUIState(): void {
+  expanded.clear()
+  collapsedInFlight.clear()
+  expandedSecs.clear()
+  expandedTurns.clear()
+}
+
 /** 跟随当前会话：会话变了就清空重载 */
 function syncSession(): void {
   const next = readActiveSession()
@@ -186,6 +213,7 @@ function syncSession(): void {
   activeSessionId = next
   rows = []
   lastSeq = 0
+  clearSessionUIState()
   if (next) void loadHistory(next)
   notify()
 }
@@ -444,8 +472,11 @@ function ActivityRowView({ row, step, stepColor, loc, stepOf }: {
   /** 行 seq → 它在轮次里的步骤序号（用于说明位置标记指向哪次请求） */
   stepOf?: Map<number, number>
 }) {
-  // 默认一律折叠：只有用户点击过的行才展开
-  const isOpen = expanded.has(row.seq)
+  const inFlight = row.settled === false
+  // 进行中行（模型生成中 / 工具执行中）默认自动展开实时看输出；
+  // 用户手动点掉才记进 collapsedInFlight（点回可再打开，定稿后不再自动展开）；
+  // 定稿行照旧：只有用户点开过的才展开。
+  const isOpen = inFlight ? !collapsedInFlight.has(row.seq) : expanded.has(row.seq)
   const hasDetail = Boolean(row.detail) || (row.sections?.length ?? 0) > 0
   const time = new Date(row.ts).toLocaleTimeString()
   // 行左侧色条：模型紫，工具行按 tag 各自颜色（skill 青 / 读文件蓝 / 写文件橙 / 命令红 / 工具灰）
@@ -457,6 +488,22 @@ function ActivityRowView({ row, step, stepColor, loc, stepOf }: {
       + (targetStep != null ? `；在请求 ${stepGlyph(targetStep)} 里发出` : '')
       + ' —— 点击跳转'
     : undefined
+  const onRowClick = (): void => {
+    if (!hasDetail) return
+    if (inFlight) {
+      if (!collapsedInFlight.has(row.seq)) {
+        // 自动展开中，用户点掉 → 记「手动收起」（定稿后保持收起）
+        collapsedInFlight.add(row.seq)
+      } else {
+        // 已手动收起，用户点回 → 打开，且定稿后保持展开
+        collapsedInFlight.delete(row.seq)
+        expanded.add(row.seq)
+      }
+    } else {
+      toggleExpand(row.seq)
+    }
+    notify()
+  }
   return h('div', {
     key: row.seq,
     style: {
@@ -465,7 +512,7 @@ function ActivityRowView({ row, step, stepColor, loc, stepOf }: {
     },
   },
     h('div', {
-      onClick: () => { if (hasDetail) toggleExpand(row.seq) },
+      onClick: onRowClick,
       // 双击这一行：这一行连详情一次性全部展开
       onDoubleClick: (e: any) => { if (hasDetail) { e.stopPropagation?.(); openFully({ rows: [row] }) } },
       style: {
@@ -474,6 +521,11 @@ function ActivityRowView({ row, step, stepColor, loc, stepOf }: {
         userSelect: 'none' as const,
       },
     },
+      // 进行中（模型生成中 / 工具执行中）：结果列前加一个闪烁标记，扫一眼就知道这行还活着
+      inFlight && h('span', {
+        style: { fontSize: 10, color: '#f59e0b', whiteSpace: 'nowrap', animation: 'am-pulse 1s ease-in-out infinite' },
+        title: '进行中：结果还在路上',
+      }, '⋯'),
       // 本轮的调用顺序：① ② ③ …（一眼看出用户消息之后底层按什么顺序被调用）
       step != null && h('span', {
         style: {
@@ -513,6 +565,16 @@ function ActivityRowView({ row, step, stepColor, loc, stepOf }: {
       }, row.summary),
       row.durationMs != null && h('span', { style: { fontSize: 11, color: '#9ca3af', whiteSpace: 'nowrap' } },
         row.durationMs >= 1000 ? `${(row.durationMs / 1000).toFixed(1)}s` : `${row.durationMs}ms`),
+      // 直观信号①：单次模型请求的 token 消耗（provider 回报 usage 后行内可见，缺省不占位）
+      row.usageIn != null && row.usageOut != null && h('span', {
+        style: { fontSize: 11, color: '#7c3aed', whiteSpace: 'nowrap' },
+        title: '本次请求 token 用量：输入 / 输出',
+      }, `⚡${row.usageIn}→${row.usageOut}`),
+      // 直观信号②：上下文超监控预算、最旧消息被整条省略（模型没看到完整上下文）——红色预警
+      (row.contextOmitted ?? 0) > 0 && h('span', {
+        style: { fontSize: 11, color: '#dc2626', fontWeight: 600, whiteSpace: 'nowrap' },
+        title: `因超出上下文预算，最早的 ${row.contextOmitted} 条消息被整条省略，模型没有看到它们`,
+      }, `⚠${row.contextOmitted} 条被省略`),
       h('span', { style: { fontSize: 11, color: '#9ca3af', whiteSpace: 'nowrap' } }, time),
     ),
     // 展开区：llm 行渲染分段（用户消息/助手回复/提示词段落），tool 行渲染单块 detail
@@ -624,7 +686,7 @@ function Toolbar() {
       style: buttonStyle(paused),
     }, paused ? '▶ 恢复' : '⏸ 暂停'),
     h('button', {
-      onClick: () => { rows = []; expanded.clear(); expandedTurns.clear(); notify() },
+      onClick: () => { rows = []; clearSessionUIState(); notify() },
       style: buttonStyle(false),
     }, '清空'),
     // 轮次默认收起，给一个一键展开/收起全部的开关（只影响轮次块，不动行内详情）
@@ -668,6 +730,18 @@ function MonitorPanel(): React.ReactElement {
   // 粘底：只有用户本来就在底部时才跟着新内容滚动；用户上拉看历史后不再被拽回底部
   const stickRef = useRef(true)
   const sessionRef = useRef<string | undefined>(activeSessionId)
+  // 进行中行的脉冲动画：挂载时注入一次 <style>（document 级去重），
+  // 行内的「⋯ 进行中」标记用 am-pulse 闪烁，用户扫一眼就知道这行还活着。
+  useEffect(() => {
+    if (typeof document === 'undefined') return
+    const STYLE_ID = 'am-pulse-style'
+    if (!document.getElementById(STYLE_ID)) {
+      const el = document.createElement('style')
+      el.id = STYLE_ID
+      el.textContent = '@keyframes am-pulse { 0%,100%{opacity:1} 50%{opacity:.35} }'
+      document.head.appendChild(el)
+    }
+  }, [])
   const onListScroll = () => {
     const el = listRef.current
     if (!el) return
@@ -753,10 +827,24 @@ export function apply(ctx: ClientContext): void {
   }, 'activity-monitor: follow current session')
 
   ctx.effect(() => {
-    const tick = () => { void refresh() }
-    pollTimer = window.setInterval(tick, 1000)
-    void refresh()
-    return () => { if (pollTimer) window.clearInterval(pollTimer) }
+    // 自适应轮询：有「进行中」的行（模型生成中/工具执行中）时 300ms 一档，
+    // 流式输出实时上屏；全空闲时退回 1s，避免空转。
+    let timer: number | undefined
+    let busy = false
+    const tick = async (): Promise<void> => {
+      if (busy) return // 上一次还没回来（网络慢/服务卡）→ 不叠请求
+      busy = true
+      try {
+        await refresh()
+      } finally {
+        busy = false
+      }
+      const busyLive = rows.some((r) => r.settled === false
+        && (!activeSessionId || r.sessionId === activeSessionId || !r.sessionId))
+      timer = window.setTimeout(tick, busyLive ? 300 : 1000)
+    }
+    void tick()
+    return () => { if (timer) window.clearTimeout(timer) }
   }, 'activity-monitor: polling')
 
   // 诊断入口（排查「跟随会话」与手工切换会话时用）：
