@@ -8,7 +8,7 @@
 //   4. /history?light=1 也不带正文；/config、/selfcheck 可用
 // 历史目录指向临时目录：冒烟不再往用户真实库里写 sess-test-1234.jsonl 这类残渣。
 import { createServer } from 'node:http'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import assert from 'node:assert/strict'
@@ -172,5 +172,6 @@ assert.ok(self.json.runId && typeof self.json.rowsInBuffer === 'number' && self.
 console.log('selfcheck:', JSON.stringify({ runId: self.json.runId, rowsInBuffer: self.json.rowsInBuffer, lastSeq: self.json.lastSeq, markGen: self.json.markGen, history: self.json.history?.appended ?? null }))
 
 await fiber.dispose()
+try { rmSync(process.env.DSH_HOME as string, { recursive: true, force: true }) } catch { /* 清不掉不影响结论 */ }
 console.log('\nALL SMOKE CHECKS PASSED')
 process.exit(0)

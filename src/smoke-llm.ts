@@ -6,7 +6,7 @@
 // 一致 —— 前端就是靠这两个标记决定「点开哪行时去取什么」。
 import { Context, Service } from '@deepseek-ai/cordis'
 import { SystemPrompt } from '@deepseek-ai/dsh-system-prompt'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import assert from 'node:assert/strict'
@@ -133,5 +133,6 @@ console.log(`增量：rows=${inc.json.rows.length} · ${inc.bytes} 字节`)
 assert.ok(inc.json.rows.every((r: any) => r.seq > snap.json.lastSeq), '增量里出现了游标之前的老行')
 
 await fiber.dispose()
+try { rmSync(process.env.DSH_HOME as string, { recursive: true, force: true }) } catch { /* 清不掉不影响结论 */ }
 console.log('\nLLM SMOKE CHECKS PASSED')
 process.exit(0)
