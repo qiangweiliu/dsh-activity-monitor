@@ -31,6 +31,7 @@ import { HistoryStore, type SessionInfo } from './history.js'
 import { MarkLog, PROTOCOL, applyMarks, computeMarks, toLight, turnKey, type LightRow, type MarkEntry } from './wire.js'
 import type { ActivityRow, ActivitySection } from './types.js'
 import { failureSig, normalizeErrorText } from './sig.js'
+import { effectiveProposalStatus } from './derive.js'
 
 // 对外 API 不变：类型仍然可从本模块取（index.js 同时是宿主半身的入口与 .d.ts 的出口）
 export type { ActivityRow, ActivitySection } from './types.js'
@@ -731,6 +732,82 @@ export function apply(ctx: Context, rawConfig?: unknown) {
     },
   }), 'activity-monitor: config route')
 
+  // 人工批准 / 否决端点（POST）：**状态变更追加成一行 proposal 行**（append-only —— 跨重启可查、
+  // 不需要改写历史 JSONL），创建行本身不动。有效状态 = 同一 id 上最新那行（见 derive.effectiveProposalStatus）。
+  // 边界：只绑环回（webServer 的 host 就是 127.0.0.1），并要求 application/json
+  // —— 浏览器对 application/json 会先发 preflight，跨站表单打不进来。
+  if (cfg.endpoints) ctx.effect(() => (ctx as any).webServer.register({
+    kind: 'exact' as const,
+    path: '/api/activity-monitor/proposal',
+    handler: async (req: any, res: any) => {
+      try {
+        if (req.method !== 'POST') {
+          sendJson(res, { v: PROTOCOL, error: '只接受 POST（人工状态变更）' }, 405)
+          return
+        }
+        if (!String(req.headers?.['content-type'] ?? '').includes('application/json')) {
+          sendJson(res, { v: PROTOCOL, error: '需要 Content-Type: application/json' }, 415)
+          return
+        }
+        const input = parseProposalTransition(await readJsonBody(req, 16 * 1024))
+        // 找目标提案：先看本进程缓冲，再扫历史库；找不到就 404（绝不写一条指不到人的变更）
+        const hit = (rs: ActivityRow[]): ActivityRow | undefined => rs.find((r) => !!r.proposal && (
+          (!!input.id && String(r.proposal?.id ?? '') === input.id)
+          || (input.seq != null && r.seq === input.seq)
+        ))
+        let target = hit(rows)
+        if (!target) {
+          for (const s of store.list()) {
+            target = hit(loadHistoryRows(store, s.key))
+            if (target) break
+          }
+        }
+        if (!target) {
+          sendJson(res, { v: PROTOCOL, error: '找不到对应提案（id/seq 不匹配）' }, 404)
+          return
+        }
+        const prev = (target.proposal ?? {}) as NonNullable<ActivityRow['proposal']>
+        const at = Date.now()
+        const row = record({
+          kind: 'proposal',
+          sessionId: target.sessionId,
+          name: 'proposal_transition',
+          tag: 'proposal',
+          summary: `${input.status} · ${prev.pkind}/${prev.action} ${prev.target}`.trim(),
+          detail: [
+            '── 状态变更 ──',
+            `${String(prev.status ?? 'proposed')} → ${input.status}`,
+            '── 提案 ──',
+            `${prev.pkind} / ${prev.action}`,
+            String(prev.target ?? ''),
+            '── 说明 ──',
+            input.note ?? '（未填写）',
+            '── 来源 ──',
+            'user（面板人工批准；本插件不执行变更，执行由人走 dshmarket / skills-manager）',
+          ].join('\n'),
+          proposal: {
+            pkind: prev.pkind,
+            action: prev.action,
+            target: String(prev.target ?? ''),
+            rationale: input.note ?? `人工状态变更：${String(prev.status ?? 'proposed')} → ${input.status}`,
+            evidenceSeqs: prev.evidenceSeqs,
+            id: prev.id,
+            transitionOf: target.seq,
+            status: input.status,
+            by: 'user',
+            at,
+          },
+        })
+        ctx.logger?.info?.(`[activity-monitor] 提案状态变更 ${String(prev.status ?? '')} → ${input.status}（变更行 seq ${row.seq}，原提案 seq ${target.seq}）`)
+        // 回带变更行的**轻行**：面板直接并进本地，不用等下一次快照
+        sendJson(res, { v: PROTOCOL, ok: true, seq: row.seq, transitionOf: target.seq, status: input.status, id: prev.id ?? null, row: toLight(row) })
+      } catch (e: any) {
+        noteError(e)
+        sendJson(res, { v: PROTOCOL, error: String(e?.message ?? e) }, 400)
+      }
+    },
+  }), 'activity-monitor: proposal route')
+
   // 自检端点：排查「面板没数据 / 历史没落盘 / 归档没跑」时的第一入口
   if (cfg.endpoints) ctx.effect(() => (ctx as any).webServer.register({
     kind: 'exact' as const,
@@ -825,6 +902,8 @@ export function apply(ctx: Context, rawConfig?: unknown) {
     let disposer: (() => void) | undefined
     let verdictDisposer: (() => void) | undefined
     let proposalDisposer: (() => void) | undefined
+    /** 提案 id 的本地序号（只用于同一毫秒内区分，稳定性靠 RUN_ID + ts） */
+    let proposalLocal = 0
     void (async () => {
       const { defineTool } = await import('@deepseek-ai/dsh-tools')
       // parameters 用 spec 形式（编译器生成给模型看的 JSON Schema）；
@@ -924,7 +1003,8 @@ export function apply(ctx: Context, rawConfig?: unknown) {
               lines.push(`进化提案：共 ${r.proposals.length} 条，待人工批准 ${r.pendingProposals} 条（本插件只写提案，不执行任何变更）`)
               for (const p of r.proposals.slice(-5)) {
                 const ev = p.evidenceSeqs.length ? ` · 证据行 ${p.evidenceSeqs.join(',')}` : ''
-                lines.push(`  #${p.seq} ${p.pkind}/${p.action} ${p.target} · ${p.status}${ev}`)
+                const changed = p.effectiveStatus !== p.status ? `（原 ${p.status}）` : ''
+                lines.push(`  #${p.seq} ${p.pkind}/${p.action} ${p.target} · ${p.effectiveStatus}${changed}${ev}${p.id ? ` · id ${p.id}` : ''}`)
               }
             }
             if (r.context.lastContextBytes != null) {
@@ -1191,6 +1271,8 @@ export function apply(ctx: Context, rawConfig?: unknown) {
             expectedEffect: trimmed(a.expectedEffect),
             verifyCommands: strsOf(a.verifyCommands),
             rollbackPlan: trimmed(a.rollbackPlan),
+            // 稳定 id：seq 是每进程计数器（跨重启重复），所以用 RUN_ID + 时间 + 本地序号
+            id: `p-${RUN_ID}-${Date.now()}-${++proposalLocal}`,
             status: 'proposed' as const,
             by: 'agent' as const,
             at: Date.now(),
@@ -1617,9 +1699,13 @@ export interface AgentReport {
     rationale: string
     status: string
     by: string
+    /** 提案稳定 id（人工端点按它指回；跨重启唯一） */
+    id: string
+    /** 有效状态：把追加的状态变更行算进来之后的最终状态（见 derive.effectiveProposalStatus） */
+    effectiveStatus: string
     evidenceSeqs: number[]
   }[]
-  /** 待人工批准（status === 'proposed'）的提案数 —— 只报数，不自动执行 */
+  /** 待人工批准（**有效状态** === 'proposed'）的提案数 —— 只报数，不自动执行 */
   readonly pendingProposals: number
   readonly context: {
     lastTurn?: number
@@ -1661,6 +1747,55 @@ function mergeActivityRows(mem: ActivityRow[], hist: ActivityRow[]): ActivityRow
  */
 function loadHistoryRows(store: HistoryStore, sessionKey: string): ActivityRow[] {
   return store.rows(sessionKey).rows
+}
+
+/**
+ * 人工状态变更的入参校验（纯函数，单测覆盖）：**只接受白名单状态**。
+ * 状态推进是「人的动作」：agent 侧的 evolution_proposal 工具永远只写 proposed，
+ * 想改状态只能走这个解析过的入口（HTTP）或显式写入。
+ */
+export function parseProposalTransition(body: unknown): {
+  id?: string
+  seq?: number
+  status: 'approved' | 'rejected' | 'applied' | 'rolled-back'
+  note?: string
+} {
+  const ALLOWED = ['approved', 'rejected', 'applied', 'rolled-back'] as const
+  const b = (body ?? {}) as Record<string, unknown>
+  const status = String(b.status ?? '')
+  if (!(ALLOWED as readonly string[]).includes(status)) {
+    throw new Error(`proposal: status 必须是 ${ALLOWED.join('|')} 之一，收到 ${JSON.stringify(b.status)}`)
+  }
+  const id = typeof b.id === 'string' && b.id.trim() ? b.id.trim().slice(0, 200) : undefined
+  const seq = typeof b.seq === 'number' && Number.isFinite(b.seq) ? Math.floor(b.seq) : undefined
+  if (!id && seq == null) throw new Error('proposal: 必须给 id 或 seq（指回要变更的提案）')
+  const note = typeof b.note === 'string' && b.note.trim() ? b.note.trim().slice(0, 500) : undefined
+  return { id, seq, status: status as (typeof ALLOWED)[number], note }
+}
+
+/** 读小型 JSON body（有上限，避免被大 body 拖住）。只有人工状态变更端点用它。 */
+function readJsonBody(req: any, cap: number): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    let size = 0
+    const chunks: Buffer[] = []
+    req.on('data', (c: Buffer) => {
+      size += c.length
+      if (size > cap) {
+        reject(new Error(`body 过大（上限 ${cap} 字节）`))
+        req.destroy?.()
+        return
+      }
+      chunks.push(c)
+    })
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'))
+      } catch {
+        reject(new Error('body 不是合法 JSON'))
+      }
+    })
+    req.on('error', (e: any) => reject(e))
+  })
 }
 
 /**
@@ -1830,22 +1965,29 @@ export function buildAgentReport(input: {
   }
 
   // ── L6 进化提案（只报数，不执行） ──
-  const proposalRows = scope.filter((r) => r.kind === 'proposal' && !!r.proposal)
-  const proposals = proposalRows.slice(-20).map((r) => {
-    const p = r.proposal as NonNullable<typeof r.proposal>
-    return {
-      seq: r.seq,
-      ts: r.ts,
-      pkind: String(p.pkind),
-      action: String(p.action),
-      target: String(p.target ?? ''),
-      rationale: String(p.rationale ?? ''),
-      status: String(p.status),
-      by: String(p.by),
-      evidenceSeqs: Array.isArray(p.evidenceSeqs) ? p.evidenceSeqs : [],
-    }
-  })
-  const pendingProposals = proposalRows.filter((r) => String(r.proposal?.status) === 'proposed').length
+  // 创建行（transitionOf 为空）是「提案」本身；带 transitionOf 的是状态变更行，不单列。
+  const effProposal = effectiveProposalStatus(scope)
+  const proposals = scope
+    .filter((r) => r.kind === 'proposal' && !!r.proposal && r.proposal?.transitionOf == null)
+    .slice(-20)
+    .map((r) => {
+      const p = r.proposal as NonNullable<typeof r.proposal>
+      const key = String(p.id ?? `session:${r.seq}`)
+      return {
+        seq: r.seq,
+        ts: r.ts,
+        pkind: String(p.pkind),
+        action: String(p.action),
+        target: String(p.target ?? ''),
+        rationale: String(p.rationale ?? ''),
+        status: String(p.status),
+        by: String(p.by),
+        id: String(p.id ?? ''),
+        effectiveStatus: effProposal.get(key)?.status ?? String(p.status),
+        evidenceSeqs: Array.isArray(p.evidenceSeqs) ? p.evidenceSeqs : [],
+      }
+    })
+  const pendingProposals = proposals.filter((p) => p.effectiveStatus === 'proposed').length
 
   // ── L3 工具级「同现」统计（只用已有数据，不新增采集） ──
   const maxTurnOfSession = new Map<string, number>()

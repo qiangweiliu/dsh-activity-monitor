@@ -28,7 +28,7 @@ export interface ClientContext {
 }
 import { createElement as h, Fragment, useEffect, useRef, useState } from 'react'
 // 派生数据（跨轮差异 / 轮次信号 / 会话汇总 / 导出）是纯函数，单独放在 derive.ts 里可单测
-import { contextDiff, fmtBytes, rowsToJson, rowsToMarkdown, sessionTotals, turnSignals } from './derive.js'
+import { contextDiff, effectiveProposalStatus, fmtBytes, rowsToJson, rowsToMarkdown, sessionTotals, turnSignals } from './derive.js'
 
 // 客户端 cordis 要求：没写进 inject 的服务，取属性会直接抛
 // "cannot get property \"sessions\" without inject"。follow 当前会话要用 sessions 服务。
@@ -77,6 +77,13 @@ interface Row {
     /** 验收命令原文 —— 只记录文本，本插件**不执行** */
     verifyCommands?: string[]
     rollbackPlan?: string
+    /**
+     * 提案稳定 id（`p-<runId>-<ts>-<n>`）：状态变更行靠它指回原提案。
+     * 不用 seq 做 id —— seq 是每进程计数器，跨重启会重复。
+     */
+    id?: string
+    /** 状态变更行的标记：指向被变更的提案（创建行没有该字段） */
+    transitionOf?: number
     /** 只能由人造/工具显式推进：agent 侧工具永远只写 'proposed'（不允许自证已执行） */
     status: 'proposed' | 'approved' | 'rejected' | 'applied' | 'rolled-back'
     by: 'agent' | 'user'
@@ -596,6 +603,63 @@ const BLOCK_STYLE = {
   tool:   { tint: 'rgba(245,158,11,.14)', soft: 'rgba(245,158,11,.06)', border: 'rgba(245,158,11,.50)' },
 } as const
 
+/**
+ * 提案状态的中文标签与配色（面板上就地显示，不弹窗）。
+ * 「待批准」是唯一需要人动手的状态；其余都是终态或已推进过的历史。
+ */
+const PROP_STYLE: Record<string, { label: string; color: string; bg: string }> = {
+  proposed:     { label: '待批准', color: '#ea580c', bg: 'rgba(234,88,12,.14)' },
+  approved:     { label: '已批准', color: '#047857', bg: 'rgba(4,120,87,.14)' },
+  rejected:     { label: '已否决', color: '#be123c', bg: 'rgba(190,18,60,.14)' },
+  applied:      { label: '已应用', color: '#1d4ed8', bg: 'rgba(29,78,216,.14)' },
+  'rolled-back': { label: '已回滚', color: '#4b5563', bg: 'rgba(75,85,99,.14)' },
+}
+
+/** 提案状态变更的在途 / 出错标记（按 rowKey）——就地显示，避免弹窗在 webview 里被吞掉 */
+const proposalBusy = new Set<string>()
+const proposalErr = new Map<string, string>()
+
+/** 有效状态缓存：rows 数组每次变更都换新对象，用引用比较当缓存键即可 */
+let propStatusCache: { src: Row[]; map: ReturnType<typeof effectiveProposalStatus> } | null = null
+function proposalStatusOf(list: Row[]): ReturnType<typeof effectiveProposalStatus> {
+  if (!propStatusCache || propStatusCache.src !== list) {
+    propStatusCache = { src: list, map: effectiveProposalStatus(list as any) }
+  }
+  return propStatusCache.map
+}
+
+/**
+ * 人工批准 / 否决一条提案。
+ *
+ * 这一动作**只写一行状态变更行**（append-only）：宿主把「谁、什么时候、改成什么」追加进同一份
+ * 会话日志，原提案行不动 —— 所以跨进程重启仍可追溯，也不需要改写历史文件。
+ * **真正执行变更（装插件 / 建技能 / 停用）不在这里**：那是人的动作，走既有的执行器
+ * （dshmarket / skills-manager），本插件不持执行权。
+ */
+async function transitionProposal(row: Row, status: 'approved' | 'rejected'): Promise<void> {
+  const k = rowKey(row)
+  if (proposalBusy.has(k)) return
+  proposalBusy.add(k)
+  proposalErr.delete(k)
+  notify()
+  try {
+    const res = await fetch('/api/activity-monitor/proposal', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: row.proposal?.id, seq: row.seq, status }),
+    })
+    const data = await res.json().catch(() => null)
+    if (!res.ok || !data?.ok) throw new Error(String(data?.error ?? `HTTP ${res.status}`))
+    // 宿主回带变更后的整行（轻行），直接并进本地：有效状态立刻变成 已批准 / 已否决
+    if (data.row) mergeRows([data.row])
+  } catch (e: any) {
+    proposalErr.set(k, String(e?.message ?? e))
+  } finally {
+    proposalBusy.delete(k)
+    notify()
+  }
+}
+
 /** 把半透明色层叠在主题底色上（深/浅主题都成立，不写死黑白） */
 const overlay = (color: string, base: string): string => `linear-gradient(${color}, ${color}), ${base}`
 
@@ -873,6 +937,44 @@ function ActivityRowView({ row, step, stepColor, loc, stepOf, prevModel }: {
         },
         title: row.kind === 'verdict' ? `验收结论行：${row.name}` : `工具名：${row.name}`,
       }, row.name),
+      // 进化提案行：状态 + 人工批准 / 否决。
+      // 生效状态 = 同一 id 上最新那条变更行（原行写的 proposed 只是初始值，所以两者不同时给提示）。
+      row.kind === 'proposal' && (() => {
+        const p = row.proposal
+        const isTransition = p?.transitionOf != null
+        const st = isTransition
+          ? String(p?.status ?? '')
+          : (proposalStatusOf(rows).get(String(p?.id ?? `session:${row.seq}`))?.status ?? String(p?.status ?? 'proposed'))
+        const stale = !isTransition && st !== String(p?.status ?? '')
+        const s = PROP_STYLE[st] ?? { label: st || '?', color: '#4b5563', bg: 'rgba(75,85,99,.14)' }
+        return h('span', {
+          style: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flex: 1 },
+        },
+          h('span', { style: { fontSize: 13, fontWeight: 600, color: tagColor, whiteSpace: 'nowrap' } },
+            `${isTransition ? '状态变更' : '提案'} · ${String(p?.pkind ?? '?')}/${String(p?.action ?? '?')} ${String(p?.target ?? '')}`),
+          h('span', {
+            style: { fontSize: 11, padding: '1px 6px', borderRadius: 8, whiteSpace: 'nowrap', color: s.color, background: s.bg },
+            title: stale ? `有效状态（原提案行写的是 ${p?.status}）` : `提案状态：${st}`,
+          }, s.label),
+          !isTransition && st === 'proposed' && h('span', { style: { display: 'flex', gap: 4 } },
+            ...(['approved', 'rejected'] as const).map((want) => h('button', {
+              key: want,
+              disabled: proposalBusy.has(k),
+              title: want === 'approved'
+                ? '批准：只追加一行状态变更（不执行任何变更；执行由人走执行器）'
+                : '否决：只追加一行状态变更',
+              onClick: (e: any) => { e.stopPropagation(); void transitionProposal(row, want) },
+              style: {
+                fontSize: 11, padding: '1px 8px', borderRadius: 8, cursor: proposalBusy.has(k) ? 'wait' : 'pointer',
+                border: `1px solid ${want === 'approved' ? '#047857' : '#be123c'}`,
+                background: 'transparent', whiteSpace: 'nowrap',
+                color: want === 'approved' ? '#047857' : '#be123c',
+              },
+            }, want === 'approved' ? '批准' : '否决'))),
+          proposalBusy.has(k) && h('span', { style: { fontSize: 11, color: '#9ca3af' } }, '提交中…'),
+          proposalErr.has(k) && h('span', { style: { fontSize: 11, color: '#be123c' } }, `失败：${proposalErr.get(k)}`),
+        )
+      })(),
       // 验收结论的状态徽标：pass 绿 / fail 红 / partial·unknown 琥珀；依据在后面的摘要位
       row.kind === 'verdict' && row.verdict && h('span', {
         style: {

@@ -3,6 +3,29 @@
 本插件遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)；协议版本见 `src/wire.ts` 的 `PROTOCOL`
 （轻行/按需正文的分层契约，变更时递增）。
 
+## [0.5.0] - 2026-10-01
+
+### 新增（提案闭环的人批侧：只记录，不执行）
+
+- **交互式待批队列**：面板上「待批准」的提案行带「批准 / 否决」按钮，点完就地刷新状态。
+- **人工端点** `POST /api/activity-monitor/proposal`，body `{id|seq, status, note?}`。
+  守卫（冒烟 13 条断言 + 活体 HTTP 实测）：非 POST → 405；非 `application/json` → 415（浏览器会先发
+  preflight，跨站表单打不进来）；状态不在白名单（**含 `proposed`**）→ 400；id/seq 指不到提案 → 404；
+  成功 → 200 并**回带变更行轻行**（面板直接并进本地，不等下一次快照）。
+- **状态变更 append-only**：追加一行带 `transitionOf` 的 proposal 行（同一稳定 `id`），原提案行不动 ——
+  跨 dsh 重启仍可追溯，且不需要改写已落盘的 JSONL。有效状态 = 同一 id 上 `(ts, seq)` 最大的那行
+  （纯函数 `derive.effectiveProposalStatus`，宿主报告与面板共用，单测覆盖乱序输入）。
+- 报告 `proposals[]` 增加 `id` 与 `effectiveStatus`；`pendingProposals` 改按**有效状态**计数。
+
+### 说明（刻意的边界）
+
+- **agent 侧无法自我批准**：`evolution_proposal` 的 `status` 不是参数（恒 `proposed`），
+  人工端点又把 `proposed` 排除在白名单外 —— 两条路都堵死。
+- **批准不是执行**：本插件不持执行权。装 / 建 / 停用仍由人走 `dshmarket` /
+  `@michengai/dsh-skills-manager`（见 `docs/agent-evolution-data.md` §10.3 红线）。
+- 变更行与提案行同属 `kind:'proposal'`：不增加 `failedCalls`、不带 `durationMs`、不进 `toolOutcome`。
+- 单测 32（+3）；冒烟新增 13 条端点端到端断言（405 / 415 / 400 / 404 / 200 / append-only / 有效状态推进）。
+
 ## [0.4.0] - 2026-10-01
 
 ### 新增（agent 自我进化的数据面与动作面）

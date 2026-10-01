@@ -41,8 +41,14 @@ dsh运行状态监控插件
   复用它们会把失败统计与耗时统计一起污染。
 - 没有任何验收结论时，报告给出 `likelyOutcome`（置信度固定 `low`，signals 里显式声明「非验收结论」）；
   有验收结论时该字段缺省 —— 不猜。
-- 本插件自身的工具调用（`activity_report` / `task_verdict`）不计入工具频次与耗时合计（见 selfNote）：
-  那是监控的记账，不是任务活动。
+- 本插件自身的工具调用（`activity_report` / `task_verdict` / `evolution_proposal`）不计入工具频次与耗时合计
+  （见 selfNote）：那是监控的记账，不是任务活动。
+- 提案只由**人**推进：面板上「待批准」的提案行带「批准 / 否决」按钮，走
+  `POST /api/activity-monitor/proposal`（body `{id|seq, status, note?}`）。端点**只追加一行状态变更行**
+  （`transitionOf` 指回原提案，append-only —— 跨重启可查，不改写历史文件），有效状态 = 同一 id 上最新那行。
+  守卫（活体实测）：非 POST → 405；非 `application/json` → 415（浏览器对它会先发 preflight，跨站表单打不进来）；
+  状态不在白名单（**含 `proposed`**）→ 400；指不到提案 → 404。
+  **批准只是记录，本插件不执行任何变更** —— 执行由人走 `dshmarket` / `skills-manager`。
 
 设计与边界（为什么本插件不做执行者、哪些信号属于别的插件、后续 L3–L5 的计划）：见
 [`docs/agent-evolution-data.md`](docs/agent-evolution-data.md)。

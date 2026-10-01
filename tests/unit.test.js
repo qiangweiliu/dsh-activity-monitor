@@ -11,11 +11,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gzipSync } from 'node:zlib'
 
-import { contextDiff, fmtBytes, rowsToJson, rowsToMarkdown, sessionTotals, turnSignals } from '../lib/derive.js'
+import { contextDiff, effectiveProposalStatus, fmtBytes, rowsToJson, rowsToMarkdown, sessionTotals, turnSignals } from '../lib/derive.js'
 import { MarkLog, applyMarks, computeMarks, toLight, turnKey } from '../lib/wire.js'
 import { failureSig, normalizeErrorText } from '../lib/sig.js'
 // 宿主半身入口：index.ts 顶层只有 type-only 依赖（会被擦除），所以单测里可以直接引 lib/index.js
-import { buildAgentReport } from '../lib/index.js'
+import { buildAgentReport, parseProposalTransition } from '../lib/index.js'
 import { defaultConfig, resolveConfig } from '../lib/config.js'
 import { HistoryStore, parseJsonl, safeSessionKey } from '../lib/history.js'
 
@@ -463,4 +463,68 @@ test('proposals 汇总：只把 proposed 计入待批，且不进 failedCalls / 
   assert.equal(r.totals.failedCalls, 1, '提案行不进 failedCalls（不能用 ok:false 表达被否决）')
   assert.equal(r.totals.durationMs, 905, '提案行不带 durationMs（报告侧跨 kind 求和）')
   assert.equal(r.toolOutcome.find((e) => e.name === 'evolution_proposal'), undefined, '提案工具自身不进 toolOutcome')
+})
+// ── L6：提案状态推进（append-only 变更行 → 有效状态） ──
+// 为什么要是 append-only：状态变更如果原地改历史行，跨进程重启后就没法知道「谁在什么时候改的」，
+// 而且要改写已落盘的 JSONL。这里用「追加一行带 transitionOf 的 proposal 行」表达变更，
+// 有效状态 = 同一 id 上 (ts, seq) 最大的那一行。
+const propRow = (over = {}) => ({
+  seq: 9, ts: 1500, sessionId: 's1', runId: 'r1', kind: 'proposal', name: 'evolution_proposal', tag: 'proposal',
+  summary: '提案 · skill/create demo', settled: true, rev: 1,
+  proposal: {
+    pkind: 'skill', action: 'create', target: 'demo', rationale: '同类失败重复 3 次',
+    id: 'p-r1-1-1', status: 'proposed', by: 'agent', at: 1500,
+  },
+  ...over,
+})
+
+test('effectiveProposalStatus：同一 id 取最新一条变更行，且不依赖输入顺序', () => {
+  const created = propRow()
+  const earlier = propRow({
+    seq: 10, ts: 1600,
+    proposal: { ...created.proposal, transitionOf: 9, status: 'approved', by: 'user', at: 1600 },
+  })
+  const later = propRow({
+    seq: 12, ts: 1700,
+    proposal: { ...created.proposal, transitionOf: 9, status: 'rejected', by: 'user', at: 1700 },
+  })
+  const m = effectiveProposalStatus([later, created, earlier]) // 故意乱序
+  assert.equal(m.get('p-r1-1-1').status, 'rejected', '(ts, seq) 最大的那条说了算')
+  assert.equal(m.get('p-r1-1-1').by, 'user')
+  assert.equal(effectiveProposalStatus([created]).get('p-r1-1-1').status, 'proposed', '没有变更行时就是初始状态')
+  // 没有 id 的老行按 session:<seq> 兜底，不能被算成两个键
+  const legacy = propRow({ proposal: { ...created.proposal, id: undefined } })
+  assert.equal(effectiveProposalStatus([legacy]).size, 1)
+})
+
+test('parseProposalTransition：只接受白名单状态，且必须指回一条提案', () => {
+  assert.equal(parseProposalTransition({ id: 'p-1', status: 'approved' }).status, 'approved')
+  assert.equal(parseProposalTransition({ seq: 9, status: 'rejected', note: '  证据不足  ' }).note, '证据不足')
+  assert.throws(() => parseProposalTransition({ id: 'p-1', status: 'proposed' }), /status 必须是/,
+    'agent 写的 proposed 不能从人工端点回灌')
+  assert.throws(() => parseProposalTransition({ id: 'p-1', status: 'applied!' }), /status 必须是/)
+  assert.throws(() => parseProposalTransition({ status: 'approved' }), /必须给 id 或 seq/)
+  assert.throws(() => parseProposalTransition(null), /status 必须是/)
+})
+
+test('报告：状态变更行让 pendingProposals 归零，但不污染其余口径', () => {
+  const base = [llm({ seq: 1, ts: 1000, durationMs: 900 }), tool({ seq: 2, ts: 1100, durationMs: 5, ok: false })]
+  const created = propRow()
+  const before = buildAgentReport({ rows: [...base, created], contextBudgetBytes: 300 * 1024, sessionId: 's1', runId: 'r1' })
+  assert.equal(before.proposals.length, 1)
+  assert.equal(before.proposals[0].effectiveStatus, 'proposed')
+  assert.equal(before.pendingProposals, 1)
+
+  const transition = propRow({
+    seq: 12, ts: 1700,
+    proposal: { ...created.proposal, transitionOf: 9, status: 'approved', by: 'user', at: 1700 },
+  })
+  const after = buildAgentReport({ rows: [...base, created, transition], contextBudgetBytes: 300 * 1024, sessionId: 's1', runId: 'r1' })
+  assert.equal(after.pendingProposals, 0, '有效状态已批准 → 不再待批')
+  assert.equal(after.proposals.length, 1, '变更行不单列成一条新提案')
+  assert.equal(after.proposals[0].status, 'proposed', '原提案行不动（append-only）')
+  assert.equal(after.proposals[0].effectiveStatus, 'approved')
+  assert.equal(after.totals.failedCalls, before.totals.failedCalls, '状态变更不改变失败计数')
+  assert.equal(after.totals.durationMs, before.totals.durationMs, '状态变更不带 durationMs（跨 kind 求和会虚高）')
+  assert.equal(after.toolOutcome.find((e) => e.name === 'evolution_proposal'), undefined, '提案/变更行不进工具 ROI')
 })

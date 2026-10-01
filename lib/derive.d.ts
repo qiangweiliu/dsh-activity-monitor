@@ -25,6 +25,8 @@ export interface DerivedRow {
         target: string;
         status: string;
         evidenceSeqs?: number[];
+        id?: string;
+        transitionOf?: number;
     };
     tag: string;
     summary: string;
@@ -93,3 +95,24 @@ export declare function sessionTotals(rows: DerivedRow[]): SessionTotals;
 export declare function rowsToMarkdown(rows: DerivedRow[], title?: string): string;
 /** 导出的会话 JSON（保持与宿主落盘行一致的结构，便于二次处理） */
 export declare function rowsToJson(rows: DerivedRow[], meta?: Record<string, unknown>): string;
+/**
+ * 提案的有效状态（宿主报告与面板共用同一口径）：**遍历到最新一条状态变更行**。
+ *
+ * 为什么要有"有效状态"：状态变更不原地改历史行，而是**追加一行**带 `transitionOf` 的
+ * proposal 行（append-only：跨重启可查、不需要改写 JSONL）。因此创建行的 `status`
+ * 只是初始值，真正的状态是同一 `id` 上 (ts, seq) 最大的那一行的 `status`。
+ *
+ * @param rows - 任一顺序的行集合（函数内部自己排序，不依赖调用方）
+ * @returns id → { status, ts, seq, by }；没有 id 的老行按 `session:<seq>` 兜底
+ */
+export declare function effectiveProposalStatus(rows: {
+    seq: number;
+    ts: number;
+    sessionId?: string;
+    proposal?: any;
+}[]): Map<string, {
+    status: string;
+    ts: number;
+    seq: number;
+    by: string;
+}>;

@@ -191,9 +191,13 @@ export interface AgentReport {
         rationale: string;
         status: string;
         by: string;
+        /** 提案稳定 id（人工端点按它指回；跨重启唯一） */
+        id: string;
+        /** 有效状态：把追加的状态变更行算进来之后的最终状态（见 derive.effectiveProposalStatus） */
+        effectiveStatus: string;
         evidenceSeqs: number[];
     }[];
-    /** 待人工批准（status === 'proposed'）的提案数 —— 只报数，不自动执行 */
+    /** 待人工批准（**有效状态** === 'proposed'）的提案数 —— 只报数，不自动执行 */
     readonly pendingProposals: number;
     readonly context: {
         lastTurn?: number;
@@ -246,6 +250,17 @@ export interface AgentReport {
         turn?: number;
     }[];
 }
+/**
+ * 人工状态变更的入参校验（纯函数，单测覆盖）：**只接受白名单状态**。
+ * 状态推进是「人的动作」：agent 侧的 evolution_proposal 工具永远只写 proposed，
+ * 想改状态只能走这个解析过的入口（HTTP）或显式写入。
+ */
+export declare function parseProposalTransition(body: unknown): {
+    id?: string;
+    seq?: number;
+    status: 'approved' | 'rejected' | 'applied' | 'rolled-back';
+    note?: string;
+};
 /**
  * 纯聚合：从活动行生成 agent 报告。只陈述事实 + 阈值判断，不替 agent 下决策。
  * 阈值可调（dupThreshold / failingThreshold / pressureThreshold），缺省 3 / 2 / 0.8。

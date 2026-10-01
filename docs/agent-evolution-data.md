@@ -317,9 +317,11 @@ readonly skillEffect: {
 
 ## 10. L6 主动配置提案层（数据层已落地 0.3.0；执行侧未做）
 
-> **状态**：提案行（`kind:'proposal'`）+ 工具 `evolution_proposal` + 报告字段
-> `proposals` / `pendingProposals` + 面板「提案」标签 已落地（单测 + 冒烟覆盖）。
-> **未做**：面板上的交互式待批队列（批准/否决按钮）、状态推进工具、执行侧接线。
+> **状态（0.5.0）**：提案行（`kind:'proposal'`）+ 工具 `evolution_proposal` + 报告字段
+> `proposals` / `pendingProposals` + 面板「提案」标签 + **交互式待批队列（批准 / 否决）与人工端点**
+> 均已落地 —— 单测 + 冒烟端点断言（405/415/400/404/200 全路径）+ 活体 HTTP 实测。
+> **未做**：执行侧接线（把 approved 的提案交给 `dshmarket` / `skills-manager` 去装 / 建 / 停用）——
+> 这一步刻意留给人，见 §10.3 红线。
 > 运行时边界（哪些变更热生效、哪些必须重启）见 §11 —— 那是本节的设计前提。
 
 **定案（2026-10）**：执行权归属 = **提案 + 人工批准**。本插件只写「提案」与「待批队列」，
@@ -353,10 +355,33 @@ readonly proposal: {
   status: 'proposed' | 'approved' | 'rejected' | 'applied' | 'rolled-back'
   by: 'agent' | 'user'
   at: number
+  id?: string            // 稳定 id（p-<runId>-<ts>-<n>）：状态变更行靠它指回。不能用 seq（每进程计数器，跨重启会重复）
+  transitionOf?: number  // 状态变更行的标记：指向被变更的提案 seq（创建行没有该字段）
 }
 ```
 
-状态只由人推进（面板批准 / 否决）或由工具显式写入 —— **不存在自动 apply 路径**。
+状态只由人推进（面板批准 / 否决，见 §10.5）或由工具显式写入 —— **不存在自动 apply 路径**。
+
+### 10.5 状态推进：append-only 变更行 + 人工端点（0.5.0）
+
+**为什么不原地改历史行**：原地改要么得改写已落盘的 JSONL，要么只在当前进程内存里生效 ——
+后者会在 dsh 重启后丢掉「谁在什么时候批准过」。所以状态变更**追加一行**带 `transitionOf` 的
+proposal 行（同一 `id`），有效状态 = 同一 id 上 `(ts, seq)` 最大的那一行的 `status`
+（纯函数 `derive.effectiveProposalStatus`，宿主报告与面板共用，单测覆盖乱序输入）。
+原提案行的 `status` 永远是 `proposed`（agent 写的初始值），报告另外给 `effectiveStatus`。
+
+| 入口 | 形状 | 守卫（活体 HTTP 实测） |
+| --- | --- | --- |
+| 面板按钮 | 提案行上的「批准 / 否决」 | 只在 `effectiveStatus === 'proposed'` 时出现 |
+| HTTP | `POST /api/activity-monitor/proposal`，body `{id\|seq, status: 'approved'\|'rejected'\|'applied'\|'rolled-back', note?}` | 非 POST → **405**；非 `application/json` → **415**；状态不在白名单（**含 `proposed`**）→ **400**；id/seq 指不到提案 → **404**；成功 → **200 + 回带变更行轻行**（面板直接并进本地，不等下一次快照） |
+
+- **agent 侧无法自我批准**：`evolution_proposal` 工具的 `status` 不是参数（恒 `proposed`），
+  人工端点又把 `proposed` 排除在白名单外 —— 两条路都堵死（各有回归断言）。
+- 端点只绑环回（`webServer` 的 host 就是 `127.0.0.1`）；要求 `application/json` 是因为浏览器对它会
+  先发 preflight，跨站表单（`text/plain`）打不进来 —— 实测被 415 挡回。这是「同源 POST 但不要 CSRF」的最小把关。
+- 变更行与提案行同属 `kind:'proposal'`：不增加 `failedCalls`、不带 `durationMs`、不进 `toolOutcome`
+  （与 verdict 同一套口径纪律，各有回归断言）。
+- **批准只记录，不执行**：执行仍由人走 `dshmarket` / `skills-manager` —— 本插件不持执行权（§10.3）。
 数据来源即 L1–L4 的输出：失败簇 → 「该学什么」、`toolOutcome` → 「哪个工具在空转」、
 `skillEffect` → 「上次加载的技能是否真有效」。
 
@@ -374,7 +399,7 @@ readonly proposal: {
 ### 10.4 落地顺序
 
 1. L1–L4 —— 判断依据（**已完成**）
-2. 提案行 + 面板待批队列（**只写不执行**，零风险，先看判断质量）
+2. 提案行 + 面板待批队列 + 人工批准端点（**只写不执行**，零风险，先看判断质量）—— **已完成 0.5.0**
 3. `task_verdict` → 试用期指标窗口自动评估（变更后 N 轮 / 7 天回归）
 4. `auto-dry-run`（自动搜索 + 装到隔离 profile + 跑 lint，不碰主环境）
 5. 按类别开 `auto-apply` —— 建议**从「停用」这类可逆操作开始，而不是「安装」**

@@ -1,6 +1,7 @@
 // 集成测试：真实 dsh-tools ToolRuntime 下，activity_report 工具注册 + 经注册表 execute + 输出 schema 校验
 // 用唯一 session id 隔离历史 JSONL，保证每次运行计数干净、可断言；退出前清理自己写的历史文件。
 import { unlinkSync } from 'node:fs'
+import { EventEmitter } from 'node:events'
 import * as path from 'node:path'
 import * as os from 'node:os'
 import { Context, Service } from '@deepseek-ai/cordis'
@@ -206,6 +207,69 @@ check(repP?.totals?.failedCalls === 2, `提案不增加 failedCalls（实 ${repP
 check(repP?.totals?.durationMs === durBeforeProposal, `提案不增加 durationMs（${durBeforeProposal} → ${repP?.totals?.durationMs}）`)
 check(!(repP?.toolOutcome ?? []).some((e: any) => e.name === 'evolution_proposal'), '提案工具自身不进 toolOutcome')
 check(Object.prototype.hasOwnProperty.call(repP ?? {}, 'proposals'), '报告含 proposals 字段（契约只加不删）')
+
+// ── L6 端点：人工批准 / 否决（真实走 handler：body 解析 → 找行 → 追加变更行 → 回带轻行） ──
+// 为什么在冒烟里做：「状态变更只能走人工端点」这条边界，只有把 handler 真跑一遍才算验过。
+const propRoute = captured.find((r: any) => r.path === '/api/activity-monitor/proposal')
+check(!!propRoute, 'proposal 路由已注册（人工状态变更入口）')
+if (propRoute) {
+  const fakeRes = (): any => {
+    const out: any = { status: 0, body: null }
+    out.writeHead = (code: number) => { out.status = code; return out }
+    out.end = (chunk: string) => { out.body = chunk ? JSON.parse(chunk) : null }
+    return out
+  }
+  // 造一个够用的 IncomingMessage：method / headers / 可读事件
+  const fakeReq = (method: string, ctype: string | undefined, payload?: unknown): any => {
+    const r: any = new EventEmitter()
+    r.method = method
+    r.headers = ctype ? { 'content-type': ctype } : {}
+    r.destroy = () => {}
+    setTimeout(() => {
+      if (payload !== undefined) r.emit('data', Buffer.from(JSON.stringify(payload)))
+      r.emit('end')
+    }, 0)
+    return r
+  }
+  const call = async (method: string, ctype: string | undefined, payload?: unknown) => {
+    const res = fakeRes()
+    await propRoute.handler(fakeReq(method, ctype, payload), res)
+    return res
+  }
+
+  const r405 = await call('GET', undefined)
+  check(r405.status === 405, `非 POST 被拒（实 ${r405.status}）`)
+  const r415 = await call('POST', 'text/plain', { seq: 1, status: 'approved' })
+  check(r415.status === 415, `缺 application/json 被拒（实 ${r415.status}）`)
+  const rBad = await call('POST', 'application/json', { seq: 1, status: 'proposed' })
+  check(rBad.status === 400 && /status 必须是/.test(String(rBad.body?.error)),
+    `人工端点不接受 proposed（实 ${rBad.status} / ${String(rBad.body?.error)}）`)
+  const r404 = await call('POST', 'application/json', { id: 'p-不存在', status: 'approved' })
+  check(r404.status === 404, `指不到提案时 404（实 ${r404.status}）`)
+
+  // 拿冒烟自己写的那条提案，走一遍真实批准
+  const before = await runReport()
+  const target = (before?.proposals ?? [])[0]
+  check(typeof target?.seq === 'number', `存在可批准的提案（seq ${target?.seq}）`)
+  const rOk = await call('POST', 'application/json', { seq: target?.seq, status: 'approved' })
+  check(rOk.status === 200 && rOk.body?.ok === true,
+    `按 seq 批准成功（实 ${rOk.status}，变更行 seq ${rOk.body?.seq}）`)
+  check(rOk.body?.row?.proposal?.transitionOf === target?.seq, '回带轻行含 transitionOf（面板可直接并进本地）')
+  const after = await runReport()
+  check(after?.pendingProposals === 0, `批准后 pendingProposals=0（实 ${after?.pendingProposals}）`)
+  check((after?.proposals ?? [])[0]?.status === 'proposed', '原提案行不动（append-only）')
+  check((after?.proposals ?? [])[0]?.effectiveStatus === 'approved', `有效状态=approved（实 ${(after?.proposals ?? [])[0]?.effectiveStatus}）`)
+  check(after?.totals?.durationMs === before?.totals?.durationMs,
+    `状态变更不带 durationMs（${before?.totals?.durationMs} → ${after?.totals?.durationMs}）`)
+  // 再否决一次：同一 id 取最新一条 → 有效状态回到 rejected，且不新增提案条目
+  const rRej = await call('POST', 'application/json', { id: target?.id, status: 'rejected' })
+  check(rRej.status === 200, `按 id 否决成功（实 ${rRej.status}）`)
+  const after2 = await runReport()
+  check((after2?.proposals ?? [])[0]?.effectiveStatus === 'rejected',
+    `最新一条说了算（实 ${(after2?.proposals ?? [])[0]?.effectiveStatus}）`)
+  check((after2?.proposals ?? []).length === 1, `变更行不单列成新提案（实 ${(after2?.proposals ?? []).length}）`)
+}
+
 
 if (fails > 0) { console.error(`FAIL: ${fails} 项未过`); finish(1) }
 console.log('ACTIVITY_REPORT SMOKE PASSED')

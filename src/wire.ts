@@ -72,6 +72,13 @@ export interface LightRow {
     /** 验收命令原文 —— 只记录文本，本插件**不执行** */
     verifyCommands?: string[]
     rollbackPlan?: string
+    /**
+     * 提案稳定 id（`p-<runId>-<ts>-<n>`）：状态变更行靠它指回原提案。
+     * 不用 seq 做 id —— seq 是每进程计数器，跨重启会重复。
+     */
+    id?: string
+    /** 状态变更行的标记：指向被变更的提案（创建行没有该字段） */
+    transitionOf?: number
     /** 只能由人造/工具显式推进：agent 侧工具永远只写 'proposed'（不允许自证已执行） */
     status: 'proposed' | 'approved' | 'rejected' | 'applied' | 'rolled-back'
     by: 'agent' | 'user'
