@@ -3,6 +3,28 @@
 本插件遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)；协议版本见 `src/wire.ts` 的 `PROTOCOL`
 （轻行/按需正文的分层契约，变更时递增）。
 
+## [0.6.1] - 2026-10-01
+
+### 修复（CI 在 Node 22 上必挂）
+
+- `test:unit` 从 `node --test tests/`（传目录）改为 `node --test tests/*.test.js`（显式文件）。
+  **根因**：Node 22 把 `node --test <目录>` 的参数当模块路径去 `require` → `Cannot find module '.../tests'`，
+  一个测试都没跑到就退出（CI 首次运行 21s 挂在这步）；本地开发机是 Node 26，它会把目录当测试目录扫描，
+  所以本地一直全绿。这类「只在 CI 的 Node 版本上炸」的问题肉眼看不出来，是 CI 首跑抓到的。
+
+### 修复（git 安装会缺文件）
+
+- `package.json` 的 `files` 漏了 `lib/cross.js` / `lib/cross.d.ts`（L5 新增的模块）。
+  本地用 `link:` 安装直接读工作目录，**永远测不出来**；git 安装（`dsh plugin add github:…`）按 `files`
+  打包 → 装出来的包在 import 阶段就会 `Cannot find module './cross.js'`。
+- 根因是**两份手写清单**（`files` 与 prepare 的产物清单）各漏一次。现在清单只保留一处（`files`），
+  新增 `scripts/check-artifacts.js` 机器核对：① `files` 条目在磁盘上都在；② 从 `lib/index.js` 出发的
+  相对 import 闭包全部在 `files` 里；③ 磁盘产物要么在 `files`、要么在显式声明的开发期产物清单里
+  （`client.raw.js` / `client.d.ts` / smoke / diag 这些故意不发布）。
+- 同一段逻辑在三个地方跑：`prepare`（安装期）、CI、`npm test`。这次就是它先跑起来、当场报出 5 处不一致。
+- 验证方式：`npm pack` 出真实产物 → 解包到无 `node_modules` 的树里跑 `prepare` → 确认 `lib/cross.js` 在位
+  且宿主入口可 import（git 安装走的正是这条路径）。
+
 ## [0.6.0] - 2026-10-01
 
 ### 新增（L5 跨会话聚合：在哪类任务上反复低效）

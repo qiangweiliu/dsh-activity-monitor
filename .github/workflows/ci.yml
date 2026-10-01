@@ -19,6 +19,10 @@ jobs:
       - name: 安装依赖
         run: npm install --ignore-scripts
 
+      # `files`（打包白名单）漂了 = git 安装装出来就缺文件：本地 link: 安装测不出来，只有这一步能拦
+      - name: 产物清单一致性（files ↔ 磁盘产物 ↔ import 闭包）
+        run: npm run check:files
+
       - name: 构建（tsc + 客户端打包）
         run: npm run build
 
@@ -26,6 +30,9 @@ jobs:
       - name: lib/ 产物新鲜度（构建后不得再有差异）
         run: git diff --exit-code -- lib/
 
+      # 注意：本步骤曾在 Node 22 上直接秒挂（`Cannot find module '.../tests'`）——
+      # `node --test <目录>` 在 Node 22 会被当成模块路径去 require，只有更新的 Node 才把目录当测试目录扫。
+      # 本地开发机是 Node 26（目录可用），CI 是 Node 22（不可用）→ 测试脚本一律写显式文件 / 通配。
       - name: 单元测试
         run: npm run test:unit
 
