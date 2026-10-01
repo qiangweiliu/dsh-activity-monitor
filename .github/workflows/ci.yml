@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # --ignore-scripts：装依赖时不跑 prepare（CI 里显式构建，避免隐式副作用）
+      - name: 安装依赖
+        run: npm install --ignore-scripts
+
+      - name: 构建（tsc + 客户端打包）
+        run: npm run build
+
+      # lib/ 是随仓库发布的编译产物：构建后必须无差异，否则说明提交的产物与源码不一致
+      - name: lib/ 产物新鲜度（构建后不得再有差异）
+        run: git diff --exit-code -- lib/
+
+      - name: 单元测试
+        run: npm run test:unit
+
+      - name: 冒烟（含 activity_report / task_verdict / evolution_proposal 契约）
+        run: npm run test:smoke
