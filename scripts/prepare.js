@@ -26,7 +26,19 @@ if (has('typescript') && has('esbuild')) {
 }
 
 // 标准安装（git 依赖 / npm registry）：校验已随仓库发布的产物
-const artifacts = ['lib/index.js', 'lib/client.js', 'lib/index.d.ts', 'cordis.patch.yml', 'package.json']
+// 清单口径：lib/index.js 运行时真正 import 的模块 + 各自的 .d.ts + 客户端包 + 补丁配置。
+// 少列一个（例如新增模块忘了加）会让标准安装装完才在 import 阶段炸 —— prepare 是唯一能在安装期拦住它的地方。
+const artifacts = [
+  'lib/index.js', 'lib/index.d.ts',
+  'lib/client.js',
+  'lib/config.js', 'lib/config.d.ts',
+  'lib/derive.js', 'lib/derive.d.ts',
+  'lib/history.js', 'lib/history.d.ts',
+  'lib/sig.js', 'lib/sig.d.ts',
+  'lib/types.js', 'lib/types.d.ts',
+  'lib/wire.js', 'lib/wire.d.ts',
+  'cordis.patch.yml', 'package.json',
+]
 const missing = artifacts.filter((rel) => !existsSync(path.join(root, rel)))
 if (missing.length) {
   console.error(`[activity-monitor prepare] 缺少已发布的产物：${missing.join(', ')}（当前环境无 typescript/esbuild 无法现场编译）——请在本仓库先跑 npm run build 并提交 lib/，或改用带 node_modules 的本地路径安装`)

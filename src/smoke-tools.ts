@@ -112,6 +112,101 @@ const argViolations = validateJsonSchemaValue(def.parameters, { sessionId: SID, 
 check(argViolations.length === 0, `参数 schema 校验通过（violations ${argViolations.length}）`)
 console.log('param schema violations:', argViolations.length === 0 ? '(none — PASS)' : JSON.stringify(argViolations))
 
+// ── L1/L2 新增能力：失败签名聚类 + task_verdict（只加不删的集成回归锚） ──
+const runReport = async () => {
+  const r = await tools.execute({
+    callId: 'call-ar-x', name: 'activity_report', arguments: { sessionId: SID },
+    agent: { session: { id: SID } } as any, signal: new AbortController().signal,
+  } as any)
+  return (r?.value ?? r?.content)?.report
+}
+// 两次「只有路径不同」的失败：归一化后应落进同一个签名簇
+const failRoot = async () => ({
+  isError: true,
+  content: [{ type: 'text', text: `Error: ENOENT: no such file or directory, open /tmp/smoke-${Math.random()}/x.txt` }],
+})
+for (let i = 0; i < 2; i++) {
+  const execCtx: any = { name: 'bash', arguments: { command: `cat /tmp/smoke/${i}.txt` }, agent: { session: { id: SID } } }
+  await (ctx as any).waterfall('tools/execute', execCtx, failRoot)
+}
+const repBefore = await runReport()
+check(repBefore?.totals?.failedCalls === 2, `新造 2 次失败调用（实 ${repBefore?.totals?.failedCalls}）`)
+check((repBefore?.failures?.[0]?.seq ?? 0) > 0, 'failures 里有行 seq 可当证据')
+const durBefore = repBefore?.totals?.durationMs
+const evidenceSeq = repBefore?.failures?.[0]?.seq ?? 0
+
+const vdef = (tools.schemas() ?? []).find((x: any) => x.name === 'task_verdict')
+check(!!vdef, 'task_verdict 已注册（agent 侧唯一写入口）')
+if (vdef) {
+  assertSupportedJsonSchema(vdef.parameters)
+  check(validateJsonSchemaValue(vdef.parameters, { status: 'pass', basis: 'x' }, 'arguments').length === 0, 'task_verdict 最小合法参数通过 schema')
+  check(validateJsonSchemaValue(vdef.parameters, { status: 'nope', basis: 'x' }, 'arguments').length > 0, '非法 status 被 enum 拦住')
+  check(validateJsonSchemaValue(vdef.parameters, { status: 'pass', basis: 'x', evidenceSeqs: ['12'] }, 'arguments').length > 0, 'evidenceSeqs 非数字被拦住')
+}
+const vres = await tools.execute({
+  callId: 'call-tv-1', name: 'task_verdict',
+  arguments: { status: 'fail', basis: '冒烟：同类 ENOENT 重复出现', evidenceSeqs: [evidenceSeq], verifyCommand: 'node lib/smoke-tools.js' },
+  agent: { session: { id: SID } } as any, signal: new AbortController().signal,
+} as any)
+check(!!vres && !vres.isError, `task_verdict 执行成功（${vres?.isError ? vres?.error?.message : 'ok'}）`)
+
+const repAfter = await runReport()
+check(repAfter?.verdicts?.length === 1, `verdicts 记录 1 条（实 ${repAfter?.verdicts?.length}）`)
+check(repAfter?.lastVerdict?.status === 'fail', `lastVerdict.status=fail（实 ${repAfter?.lastVerdict?.status}）`)
+check(repAfter?.lastVerdict?.seq === vres?.value?.verdict?.seq, 'verdict 回执 seq 与报告一致')
+check(repAfter?.totals?.failedCalls === repBefore?.totals?.failedCalls, `verdict 不增加 failedCalls（${repBefore?.totals?.failedCalls} → ${repAfter?.totals?.failedCalls}）`)
+check(repAfter?.totals?.durationMs === durBefore, `verdict 不增加 durationMs（${durBefore} → ${repAfter?.totals?.durationMs}）`)
+check((repAfter?.failureClusters?.length ?? 0) === 1, `同类失败聚成 1 簇（实 ${repAfter?.failureClusters?.length}）`)
+check(repAfter?.failureClusters?.[0]?.count === 2, `簇内 2 条（实 ${repAfter?.failureClusters?.[0]?.count}）`)
+check((repAfter?.failures?.length ?? 0) >= 2, `failures 原样保留（实 ${repAfter?.failures?.length}）`)
+check(String(repAfter?.failureClusters?.[0]?.sig ?? '').includes('<path>'), `签名已把路径归一化：${repAfter?.failureClusters?.[0]?.sig}`)
+check(repAfter?.likelyOutcome === undefined, '有验收结论时不给过程推断（不猜）')
+
+// ── L3/L4：工具级同现统计 + 技能加载前后窗口（走真实钩子造数据） ──
+const skillRoot = async () => ({ isError: false, content: [{ type: 'text', text: 'skill loaded' }], value: 'skill loaded' })
+await (ctx as any).waterfall('tools/execute', { name: 'skill', arguments: { name: 'smoke-demo' }, agent: { session: { id: SID } } }, skillRoot)
+const repL34 = await runReport()
+check((repL34?.skillLoads ?? []).some((s: any) => s.name === 'smoke-demo'), `skillLoads 记录 skill 加载（实 ${JSON.stringify(repL34?.skillLoads)}）`)
+check((repL34?.skillEffect ?? []).length === 1, `skillEffect 生成 1 条对比（实 ${(repL34?.skillEffect ?? []).length}）`)
+const bashOut = (repL34?.toolOutcome ?? []).find((e: any) => e.name === 'bash')
+check(!!bashOut, 'toolOutcome 里有 bash')
+check((bashOut?.failed ?? 0) >= 2, `toolOutcome 的 bash 失败数 ≥2（实 ${bashOut?.failed}）`)
+check((bashOut?.retriedInTurn ?? 0) >= 1, `bash 同轮重试 ≥1（实 ${bashOut?.retriedInTurn}）`)
+check((bashOut?.inTurnWithVerdictFail ?? 0) >= 1, `bash 出现在带 fail 验收的轮次里（实 ${bashOut?.inTurnWithVerdictFail}）`)
+check(!(repL34?.toolOutcome ?? []).some((e: any) => e.name === 'task_verdict' || e.name === 'activity_report'), '本插件自身工具不进 toolOutcome')
+check(Object.prototype.hasOwnProperty.call(repL34 ?? {}, 'toolOutcome'), '报告含 toolOutcome 字段（契约只加不删）')
+
+// ── L6：进化提案（本插件只写提案，不执行任何变更） ──
+const pdef = (tools.schemas() ?? []).find((x: any) => x.name === 'evolution_proposal')
+check(!!pdef, 'evolution_proposal 已注册（进化提案入口）')
+if (pdef) {
+  assertSupportedJsonSchema(pdef.parameters)
+  check(validateJsonSchemaValue(pdef.parameters, { pkind: 'skill', action: 'create', target: 'x', rationale: 'y' }, 'arguments').length === 0, 'evolution_proposal 最小合法参数通过 schema')
+  check(validateJsonSchemaValue(pdef.parameters, { pkind: 'nope', action: 'create', target: 'x', rationale: 'y' }, 'arguments').length > 0, '非法 pkind 被 enum 拦住')
+  check(validateJsonSchemaValue(pdef.parameters, { pkind: 'skill', action: 'nope', target: 'x', rationale: 'y' }, 'arguments').length > 0, '非法 action 被 enum 拦住')
+}
+const durBeforeProposal = (await runReport())?.totals?.durationMs
+const pres = await tools.execute({
+  callId: 'call-ep-1', name: 'evolution_proposal',
+  arguments: {
+    pkind: 'skill', action: 'create', target: 'smoke-proposal-skill',
+    rationale: '冒烟：同一 ENOENT 签名重复 2 次，建议把这条契约写成技能',
+    evidenceSeqs: [evidenceSeq], expectedEffect: '该签名 7 天内归零',
+    verifyCommands: ['node lib/smoke-tools.js'], rollbackPlan: '删除该技能目录',
+  },
+  agent: { session: { id: SID } } as any, signal: new AbortController().signal,
+} as any)
+check(!!pres && !pres.isError, `evolution_proposal 执行成功（${pres?.isError ? pres?.error?.message : 'ok'}）`)
+const repP = await runReport()
+check((repP?.proposals?.length ?? 0) === 1, `proposals 记录 1 条（实 ${repP?.proposals?.length ?? 0}）`)
+check(repP?.pendingProposals === 1, `pendingProposals=1（待人工批准，实 ${repP?.pendingProposals}）`)
+check(repP?.proposals?.[0]?.status === 'proposed', '提案状态固定 proposed（agent 不能自证已执行）')
+check(repP?.proposals?.[0]?.evidenceSeqs?.[0] === evidenceSeq, '提案能指回证据行 seq')
+check(repP?.totals?.failedCalls === 2, `提案不增加 failedCalls（实 ${repP?.totals?.failedCalls}）`)
+check(repP?.totals?.durationMs === durBeforeProposal, `提案不增加 durationMs（${durBeforeProposal} → ${repP?.totals?.durationMs}）`)
+check(!(repP?.toolOutcome ?? []).some((e: any) => e.name === 'evolution_proposal'), '提案工具自身不进 toolOutcome')
+check(Object.prototype.hasOwnProperty.call(repP ?? {}, 'proposals'), '报告含 proposals 字段（契约只加不删）')
+
 if (fails > 0) { console.error(`FAIL: ${fails} 项未过`); finish(1) }
 console.log('ACTIVITY_REPORT SMOKE PASSED')
 finish(0)

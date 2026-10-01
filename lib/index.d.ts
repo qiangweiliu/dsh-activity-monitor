@@ -1,83 +1,37 @@
+/**
+ * dsh-activity-monitor — node 半（Host 侧）
+ *
+ * 监控对话运行时的所有操作，内存里维护一个活动环形缓冲：
+ *  - llm/stream waterfall      → 每次模型请求（一个"轮次"）：模型名、耗时、token 用量，
+ *    以及 system prompt 全文（从 messages 的 system 角色消息提取）+ 助手回复文本
+ *  - tools/execute waterfall   → 每次工具调用（skill 加载、文件读写、命令执行……）
+ *    从工具名+参数中归类出：skill 文件、读写文件、执行命令
+ *
+ * 轮次口径（面板自己维护，不取运行时的 turn 事件）：
+ *   一个轮次 = 一次 agent 向模型发起的请求。轮次开始 = 请求发出（llm 占位行落下），
+ *   轮次结束 = 该次模型回复完成（llm 行定稿）。轮次号 = 该会话内第 N 次模型请求。
+ *   工具执行发生在两轮模型请求之间（上一轮回复里的 tool-call 被执行、结果追加进消息后
+ *   才发起下一次请求），因此工具行归属「下一次」请求所在轮次（N+1），作为该轮的前置步骤。
+ *
+ * 所有行都走「进行中 → 定稿」两段式：调用一开始就落行（ok 缺省 = 进行中，
+ * 前端按 rev 递增原地刷新）；结束时同一行补全耗时/详情/完整分段（seq/ts 不变、不新增行），
+ * 定稿版本此时才写入按 session 分文件的 JSONL 历史。
+ *
+ * 展示约定（与浏览器半配合）：
+ *  - detail 默认折叠；除非行内有 collapsed: false 标记，前端默认全部折叠
+ *  - system prompt 按来源 section 拆分展示（从 systemMessageSections 记录）
+ *
+ * 通过 webServer 注册 /api/activity-monitor/snapshot 端点，浏览器侧板轮询读取。
+ */
 import type { Context } from '@deepseek-ai/cordis';
+import type { ActivityRow } from './types.js';
+export type { ActivityRow, ActivitySection } from './types.js';
+export type { LightRow, MarkEntry } from './wire.js';
+export { failureSig, normalizeErrorText } from './sig.js';
+export { Config } from './config.js';
 export declare const name = "activity-monitor";
 export declare const inject: readonly ["webServer", "systemPrompt"];
-/** `sections` 中的一段详情：key 非空 → 前端二级折叠（提示词段落），无 key 的默认展开（用户消息/回复） */
-export interface ActivitySection {
-    title: string;
-    body: string;
-    /** 分段标识；非空表示前端默认折叠、点击标题才展开 */
-    key?: string;
-    /** 分组标题行：它下面 parent 指向本段 key 的子段在界面上缩进，且整组默认收起 */
-    isGroup?: boolean;
-    /** 所属分组标题的 key（配合 isGroup 使用） */
-    parent?: string;
-    /** 正文里各消息块在 body 中的起始偏移（渲染时按它切分，供组内按「第 n 条消息」跳转定位；正文本身不加标记） */
-    anchorOffsets?: number[];
-}
-/** 单条活动记录 */
-export interface ActivityRow {
-    readonly seq: number;
-    readonly ts: number;
-    /** 所属会话 id（dsh SessionId），便于区分多会话 */
-    readonly sessionId?: string;
-    /** llm | tool */
-    readonly kind: 'llm' | 'tool';
-    /** 模型名或工具名 */
-    readonly name: string;
-    /** 归类标签：skill / file-read / file-write / command / tool / llm */
-    readonly tag: string;
-    /** 单行摘要（文件名、命令行、skill 名等） */
-    readonly summary: string;
-    /** 详情：前端一律默认折叠，点开才显示（不再自动展开） */
-    detail?: string;
-    /** 多段详情：key 非空的段在前端二级折叠（提示词段落），无 key 的默认展开（用户消息/回复） */
-    sections?: ActivitySection[];
-    /**
-     * 本次请求所在轮次号（该会话内 agent 发起的第 N 次模型请求，从 1 起）。
-     * 一个轮次 = 一次模型请求（agent 发消息给大模型 → 大模型回复完成）；
-     * 工具执行发生在两轮之间，归属下一次请求所在轮次。
-     * 不属于任何请求行的（理论上没有；标题生成等无 sessionId 的也按最近会话发号）
-     */
-    turn?: number;
-    /**
-     * 本次请求里模型发起的工具调用及其在「完整上下文」中的位置：
-     * msgIndex = 第几条消息（0 基，与界面上 [n] 一致）、callIndex = 该消息内第几个 tool-call（1 起）、
-     * resultMsgIndex = 对应工具结果所在消息下标（工具结果还没回来时缺省）。
-     * 前端据此把「工具行」对回消息序列里的位置。
-     */
-    calls?: {
-        name: string;
-        msgIndex: number;
-        callIndex: number;
-        resultMsgIndex?: number;
-    }[];
-    /** 定稿标记：缺省/true = 已结束；false = 该行仍在进行中（调用还没结束） */
-    readonly settled?: boolean;
-    durationMs?: number;
-    ok?: boolean;
-    /** 原始 token 用量（llm 行；缺省 = provider 未回报） */
-    usageIn?: number;
-    usageOut?: number;
-    /** 发给模型的上下文规模（llm 行）：上下文字节数 / 消息条数 / 工具清单字节 */
-    contextBytes?: number;
-    contextMessages?: number;
-    toolBytes?: number;
-    /** 该请求因超预算被整条省略的消息数（>0 = 模型没看到完整上下文） */
-    contextOmitted?: number;
-    /**
-     * 行版本：同 seq/ts 的行在「进行中 → 定稿」之间原地刷新，rev 随每次刷新递增；
-     * 前端用它判断该行是否真的变了（变了才重渲染），不再依赖字段对比。
-     */
-    rev?: number;
-    /**
-     * 所属进程运行 id：每个 dsh 进程 boot 时生成一个唯一号，随 JSONL 落盘。
-     * seq / turn 都是「每进程」计数器，进程一重启就归零，历史 JSONL 跨重启合并后
-     * 不同运行的编号会重叠（旧片段 seq 8/7 撞上新片段 seq 1/3）。runId 用来把
-     * 数据按运行切分：agent 报告据此区分「本运行」与「跨重启的历史运行」，绝不混算。
-     */
-    runId?: string;
-}
-export declare function apply(ctx: Context): void;
+export declare function apply(ctx: Context, rawConfig?: unknown): void;
 /**
  * 面向 agent 的监控统计报告。给 agent 提供「自查信号」：
  * 调用量 / token / 耗时、各工具调用频次与失败、上下文压力（相对预算、是否截断），
@@ -129,6 +83,118 @@ export interface AgentReport {
         name: string;
         summary: string;
     }[];
+    /**
+     * 失败聚类（L1，只加不删）：按 failSig 把同类失败聚成一簇；failures 原样保留。
+     * 历史行没有 failSig（那时还没这个字段），归到 `${name}|legacy|…` 的单列簇，
+     * 不与真签名混算 —— 否则会凭空造出一个「重复失败」的假信号。
+     */
+    readonly failureClusters: {
+        sig: string;
+        tool: string;
+        errClass: string;
+        count: number;
+        /** 出现过的轮次号（升序） */
+        turns: number[];
+        firstSeq: number;
+        lastSeq: number;
+        /** 最多 3 条样本 seq，供 agent 用 /row 回查正文 */
+        exampleSeqs: number[];
+        /** 该签名首条样本的摘要（≤120 字） */
+        sampleSummary: string;
+    }[];
+    /** failures 被上限截断时的提示；未截断则缺省（聚类不受上限影响，始终覆盖全部失败） */
+    readonly failuresTruncated?: {
+        total: number;
+        shown: number;
+    };
+    /** 验收结论行（kind === 'verdict'），按时间升序，最多 20 条 */
+    readonly verdicts: {
+        seq: number;
+        ts: number;
+        status: string;
+        basis: string;
+        evidenceSeqs: number[];
+    }[];
+    /** 最近一条验收结论；没有则缺省 */
+    readonly lastVerdict?: {
+        seq: number;
+        ts: number;
+        status: string;
+        basis: string;
+    };
+    /**
+     * 过程推断的「可能结果」——**只在没有任何验收结论时**给出，置信度固定 low。
+     * 它不是验收结论：有 verdict 时字段缺省（不猜），signals 里也会显式声明这一点。
+     */
+    readonly likelyOutcome?: {
+        label: 'likely-pass' | 'likely-fail';
+        confidence: 'low';
+        reasons: string[];
+    };
+    /**
+     * 工具级「同现」统计（L3）：某工具的调用出现在**什么样的轮次**里 —— 收敛轮（该会话本范围内
+     * 最后一轮）、重试轮（同轮内再次调用）、带验收结论的轮次（pass / fail）。
+     * **这是同现统计、不是因果推断**（没有对照组）：只能说「工具 X 出现在通过验收的轮次 N 次」，
+     * 不能说「工具 X 带来成功」。带 pass/fail 的两项依赖验收结论，没有 verdict 时恒为 0。
+     * 已剔除本插件自身工具（见自我观测剔除）。
+     */
+    readonly toolOutcome: {
+        name: string;
+        calls: number;
+        failed: number;
+        /** 该工具行所在轮次 = 该会话（本范围内）的最后一轮 */
+        inFinalTurn: number;
+        /** 同一轮内该工具被再次调用（第 2 次起累加） */
+        retriedInTurn: number;
+        inTurnWithVerdictPass: number;
+        inTurnWithVerdictFail: number;
+    }[];
+    /** 技能加载（tag === 'skill' 的行）；名称取自 `summary: 'skill: <name>'` */
+    readonly skillLoads: {
+        name: string;
+        seq: number;
+        ts: number;
+        turn: number;
+    }[];
+    /**
+     * 技能加载前后窗口对比（L4）。**只做前后对比，不是 A/B**：没有对照组，且窗口内任务难度
+     * 也不同 —— 只能当「值得进一步验证」的线索。窗口内没有行时该项缺省（不填 0，
+     * 否则看起来像「这段时间没有任何活动」）。
+     */
+    readonly skillEffect: {
+        name: string;
+        loads: number;
+        windowBefore?: {
+            turns: number;
+            toolCalls: number;
+            failedCalls: number;
+            inputTokens: number;
+        };
+        windowAfter?: {
+            turns: number;
+            toolCalls: number;
+            failedCalls: number;
+            inputTokens: number;
+        };
+    }[];
+    /**
+     * 进化提案（L6）：agent 用 evolution_proposal 写下的提案行。**本插件只报数、不执行**：
+     * 批准与执行由人通过既有执行器（dshmarket / skills-manager）完成，见 docs §10。
+     * 提案状态只可能由人或显式写入推进，agent 侧工具永远只写 `proposed`。
+     */
+    readonly proposals: {
+        seq: number;
+        ts: number;
+        pkind: string;
+        action: string;
+        target: string;
+        rationale: string;
+        status: string;
+        by: string;
+        evidenceSeqs: number[];
+    }[];
+    /** 待人工批准（status === 'proposed'）的提案数 —— 只报数，不自动执行 */
+    readonly pendingProposals: number;
     readonly context: {
         lastTurn?: number;
         lastContextBytes?: number;
@@ -193,4 +259,16 @@ export declare function buildAgentReport(input: {
     dupThreshold?: number;
     failingThreshold?: number;
     pressureThreshold?: number;
+    /** failures 明细最多返回多少条（默认 20）；聚类不受它影响 */
+    maxFailures?: number;
+    /** 失败聚类的最小重复次数（默认 2，下限 2）：单次失败不成簇，避免把偶发当模式 */
+    clusterMinCount?: number;
+    /** 技能前后对比的窗口轮数（默认 3，下限 1）：取加载轮前后各 N 轮做指标对比 */
+    skillWindowTurns?: number;
+    /**
+     * 「本运行」的判定基准，缺省 = 本进程 RUN_ID。
+     * 报告的 totals/tools/failures/verdicts 只统计这个 runId 的行，其余单列于 history ——
+     * 所以聚合别的运行（或单测里造数据）必须显式指定它，否则会被当成历史片段。
+     */
+    runId?: string;
 }): AgentReport;

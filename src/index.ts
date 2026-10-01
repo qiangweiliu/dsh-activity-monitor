@@ -23,12 +23,23 @@
  *
  * 通过 webServer 注册 /api/activity-monitor/snapshot 端点，浏览器侧板轮询读取。
  */
-import { mkdirSync, appendFileSync, readFileSync, readdirSync, statSync } from 'node:fs'
-import * as path from 'node:path'
-import * as os from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
 // 引入类型以触发 declaration merge（Events 的 tools/* 键）
 import type {} from '@deepseek-ai/dsh-tools'
+import { resolveConfig, type AMConfig } from './config.js'
+import { HistoryStore, type SessionInfo } from './history.js'
+import { MarkLog, PROTOCOL, applyMarks, computeMarks, toLight, turnKey, type LightRow, type MarkEntry } from './wire.js'
+import type { ActivityRow, ActivitySection } from './types.js'
+import { failureSig, normalizeErrorText } from './sig.js'
+
+// 对外 API 不变：类型仍然可从本模块取（index.js 同时是宿主半身的入口与 .d.ts 的出口）
+export type { ActivityRow, ActivitySection } from './types.js'
+export type { LightRow, MarkEntry } from './wire.js'
+// 失败签名/归一化是纯函数，单独成模块（sig.ts）以便单测直接引 lib/sig.js；
+// 这里再导出一份，维持「index.js 是宿主半身唯一出口」的既有约定。
+export { failureSig, normalizeErrorText } from './sig.js'
+// cordis 读的配置声明（Standard Schema；解析/默认值/失败软着陆都在 config.ts）
+export { Config } from './config.js'
 
 export const name = 'activity-monitor'
 
@@ -40,102 +51,56 @@ interface SkillsLike {
   get(name: string, options?: any): Promise<{ name: string; path?: string; content?: string } | undefined>
 }
 
-/** `sections` 中的一段详情：key 非空 → 前端二级折叠（提示词段落），无 key 的默认展开（用户消息/回复） */
-export interface ActivitySection {
-  title: string
-  body: string
-  /** 分段标识；非空表示前端默认折叠、点击标题才展开 */
-  key?: string
-  /** 分组标题行：它下面 parent 指向本段 key 的子段在界面上缩进，且整组默认收起 */
-  isGroup?: boolean
-  /** 所属分组标题的 key（配合 isGroup 使用） */
-  parent?: string
-  /** 正文里各消息块在 body 中的起始偏移（渲染时按它切分，供组内按「第 n 条消息」跳转定位；正文本身不加标记） */
-  anchorOffsets?: number[]
-}
-
-/** 单条活动记录 */
-export interface ActivityRow {
-  readonly seq: number
-  readonly ts: number
-  /** 所属会话 id（dsh SessionId），便于区分多会话 */
-  readonly sessionId?: string
-  /** llm | tool */
-  readonly kind: 'llm' | 'tool'
-  /** 模型名或工具名 */
-  readonly name: string
-  /** 归类标签：skill / file-read / file-write / command / tool / llm */
-  readonly tag: string
-  /** 单行摘要（文件名、命令行、skill 名等） */
-  readonly summary: string
-  /** 详情：前端一律默认折叠，点开才显示（不再自动展开） */
-  detail?: string
-  /** 多段详情：key 非空的段在前端二级折叠（提示词段落），无 key 的默认展开（用户消息/回复） */
-  sections?: ActivitySection[]
-  /**
-   * 本次请求所在轮次号（该会话内 agent 发起的第 N 次模型请求，从 1 起）。
-   * 一个轮次 = 一次模型请求（agent 发消息给大模型 → 大模型回复完成）；
-   * 工具执行发生在两轮之间，归属下一次请求所在轮次。
-   * 不属于任何请求行的（理论上没有；标题生成等无 sessionId 的也按最近会话发号）
-   */
-  turn?: number
-  /**
-   * 本次请求里模型发起的工具调用及其在「完整上下文」中的位置：
-   * msgIndex = 第几条消息（0 基，与界面上 [n] 一致）、callIndex = 该消息内第几个 tool-call（1 起）、
-   * resultMsgIndex = 对应工具结果所在消息下标（工具结果还没回来时缺省）。
-   * 前端据此把「工具行」对回消息序列里的位置。
-   */
-  calls?: { name: string; msgIndex: number; callIndex: number; resultMsgIndex?: number }[]
-  /** 定稿标记：缺省/true = 已结束；false = 该行仍在进行中（调用还没结束） */
-  readonly settled?: boolean
-  durationMs?: number
-  ok?: boolean
-  /** 原始 token 用量（llm 行；缺省 = provider 未回报） */
-  usageIn?: number
-  usageOut?: number
-  /** 发给模型的上下文规模（llm 行）：上下文字节数 / 消息条数 / 工具清单字节 */
-  contextBytes?: number
-  contextMessages?: number
-  toolBytes?: number
-  /** 该请求因超预算被整条省略的消息数（>0 = 模型没看到完整上下文） */
-  contextOmitted?: number
-  /**
-   * 行版本：同 seq/ts 的行在「进行中 → 定稿」之间原地刷新，rev 随每次刷新递增；
-   * 前端用它判断该行是否真的变了（变了才重渲染），不再依赖字段对比。
-   */
-  rev?: number
-  /**
-   * 所属进程运行 id：每个 dsh 进程 boot 时生成一个唯一号，随 JSONL 落盘。
-   * seq / turn 都是「每进程」计数器，进程一重启就归零，历史 JSONL 跨重启合并后
-   * 不同运行的编号会重叠（旧片段 seq 8/7 撞上新片段 seq 1/3）。runId 用来把
-   * 数据按运行切分：agent 报告据此区分「本运行」与「跨重启的历史运行」，绝不混算。
-   */
-  runId?: string
-}
-
-const MAX_ROWS = 500
+// 数据结构（ActivityRow / ActivitySection）已移到 types.ts，见文件头的 re-export
 
 /**
  * 本进程运行 id：boot 时生成一次（时间戳 + 随机后缀，足以区分同机不同实例）。
  * 随每行落盘，agent 报告据此把「本运行」与「跨重启的历史运行」切开，避免把
  * 两个进程里各自 1..N 的 seq/turn 编号当成一套连续编号。历史 JSONL 里没有
  * 该字段的旧行视为「未知/重启前」运行。
+ * 面板侧也用它判断宿主是否重启过 —— 重启后 seq 从头开始，客户端若继续拿旧游标
+ * 拉增量会永远拉不到新行（表现为「面板卡住不动」）。
  */
 const RUN_ID = `run-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`
 
-/** 历史存储目录：$DSH_HOME（默认 ~/.dsh）/activity-monitor，按 session 分文件（JSONL） */
-const HISTORY_DIR = path.join(
-  process.env.DSH_HOME ?? path.join(process.env.HOME ?? os.homedir(), '.dsh'),
-  'activity-monitor',
-)
-const historyFiles = new Map<string, string>() // sessionId → 文件路径（启动时扫描）
+/** 宿主侧运行计数（/selfcheck 暴露；排查「面板没数据」时先看它） */
+interface SelfState {
+  startedAt: number
+  requests: number
+  badRequests: number
+  endpointErrors: number
+  rowBodyHits: number
+  rowBodyMisses: number
+  lastError?: string
+}
 
-export function apply(ctx: Context) {
+export function apply(ctx: Context, rawConfig?: unknown) {
+  // 配置解析（失败软着陆：非法项退回默认值并记进 cfg.issues，绝不因此拒绝加载）
+  const cfg: AMConfig = resolveConfig(rawConfig)
+  // 把预算推给模块级纯函数（buildContextSections / buildAgentReport 不持有 ctx，理由见该常量注释）
+  CONTEXT_BUDGET_BYTES = cfg.contextBudgetBytes
   ctx.logger.info('[activity-monitor] starting')
+  if (cfg.issues.length) {
+    ctx.logger.warn(`[activity-monitor] 配置有 ${cfg.issues.length} 项被修正/忽略：${cfg.issues.join('；')}`)
+  }
 
   let seq = 0
   const rows: ActivityRow[] = []
-  try { mkdirSync(HISTORY_DIR, { recursive: true }) } catch { /* ignore */ }
+  /** 轮次边界标记的增量日志（协议 v2：客户端按 markGen 游标取增量，不再回看尾部 N 行） */
+  const markLog = new MarkLog(cfg.markLogCap)
+  /** 历史落盘：异步串行队列 + 索引 + 归档（见 history.ts 文件头的三个实测动机） */
+  const store = new HistoryStore({
+    dir: cfg.history.dir,
+    archiveAfterDays: cfg.history.archiveAfterDays,
+    maxCachedSessions: cfg.history.maxCachedSessions,
+  })
+  // 卸载兜底：待写缓冲里可能还有几百 KB 没落盘，close() 会同步刷出去
+  ctx.effect(() => () => { store.close() }, 'activity-monitor: history store')
+  const self: SelfState = { startedAt: Date.now(), requests: 0, badRequests: 0, endpointErrors: 0, rowBodyHits: 0, rowBodyMisses: 0 }
+  function noteError(e: unknown): void {
+    self.endpointErrors++
+    self.lastError = e instanceof Error ? e.message : String(e)
+  }
 
   // ── 轮次跟踪（面板自维护，不取运行时 turn 事件） ──
   // 轮次口径：一个轮次 = agent 向模型发起的一次请求。
@@ -147,32 +112,67 @@ export function apply(ctx: Context) {
   const turnsIssued = new Map<string, number>()      // sessionId → 已发出的请求（轮次）数
   const closedTurns = new Map<string, Set<number>>() // sessionId → 已结束（模型回复完成）的轮次号
   let lastTurnSession: string | undefined            // 兜底：行没有 sessionId 时沿用最近一次请求所属会话
+  /** 每个 (session, turn) 的首/末行 seq —— 给轮次边界标记定位用（不必每次全表扫） */
+  const turnFirst = new Map<string, number>()
+  const turnLast = new Map<string, number>()
   /** upcoming 轮次号：工具行（在请求之间执行）归属的轮次 */
   function turnFor(sessionId?: string): number | undefined {
     const sid = sessionId ?? lastTurnSession
     if (!sid) return undefined
     return (turnsIssued.get(sid) ?? 0) + 1
   }
-  /** 给某 (session, turn) 记「已结束」 */
+  /** 该轮是否已结束（模型回复已定稿） */
+  function isTurnClosed(sessionId: string, turn: number): boolean {
+    return closedTurns.get(sessionId)?.has(turn) ?? false
+  }
+  /**
+   * 记「一行进了某个轮次」，并按需补/搬 turnEnd 标记：
+   *  - 该轮第一次出现 → 补 turnStart
+   *  - 该轮已结束却又来了一行（工具结果、兜底发号等）→ 末行标记搬到新行，旧行显式清除
+   * 这正是协议 v2 用 marks 日志取代「每次回看尾部 30 行」的地方：标记是**事后**补的，
+   * 纯增量轮询拿不到「已下发过的旧行变了」，所以每次变更都发一个代数（gen）给客户端增量取。
+   */
+  function noteRowInTurn(sessionId: string | undefined, turn: number | undefined, rowSeq: number): void {
+    if (!turn) return
+    const k = turnKey(sessionId, turn)
+    const prevLast = turnLast.get(k)
+    const isFirst = !turnFirst.has(k)
+    if (isFirst) turnFirst.set(k, rowSeq)
+    turnLast.set(k, rowSeq)
+    const patch: { seq: number; turnStart?: boolean; turnEnd?: boolean }[] = []
+    if (isFirst) patch.push({ seq: rowSeq, turnStart: true })
+    if (isTurnClosed(sessionId ?? '', turn) && prevLast !== undefined && prevLast !== rowSeq) {
+      patch.push({ seq: rowSeq, turnEnd: true })
+      patch.push({ seq: prevLast, turnEnd: false })
+    }
+    markLog.bump(patch)
+  }
+  /** 给某 (session, turn) 记「已结束」，并把 turnEnd 标到该轮末行 */
   function closeTurn(sessionId: string, turn: number): void {
     let set = closedTurns.get(sessionId)
     if (!set) { set = new Set(); closedTurns.set(sessionId, set) }
+    if (set.has(turn)) return
     set.add(turn)
+    const last = turnLast.get(turnKey(sessionId, turn))
+    if (last !== undefined) markLog.bump([{ seq: last, turnEnd: true }])
   }
 
   /**
    * 已落盘的逻辑行键（首次 record 时的 seq:ts）：同一逻辑行只写一次 JSONL。
    * 挤出缓冲后 updateRow 会重排 seq（新 seq 作内存键），但逻辑键不变 —— 去重按逻辑键。
+   * 集合只增不减会在长会话里单调泄漏，超过上限就整批清掉（最坏情形是同一行重复落盘一次，
+   * 客户端按 seq:ts 去重后无感）。
    */
   const persistedKeys = new Set<string>()
+  const PERSIST_KEY_CAP = 20_000
   function persist(full: ActivityRow, logicKey?: string): void {
     const k = logicKey ?? `${full.seq}:${full.ts}`
     if (persistedKeys.has(k)) return
-    try {
-      const file = path.join(HISTORY_DIR, `${(full.sessionId ?? 'global').replace(/[^a-zA-Z0-9._-]/g, '_')}.jsonl`)
-      appendFileSync(file, JSON.stringify(full) + '\n')
-      persistedKeys.add(k)
-    } catch { /* 磁盘异常不影响主流程 */ }
+    persistedKeys.add(k)
+    if (persistedKeys.size > PERSIST_KEY_CAP) persistedKeys.clear()
+    // 异步串行队列落盘（history.ts）：v1 在这里 appendFileSync，一行的体积平均 15KB、
+    // 最坏 265KB，等于每次模型回复收尾都同步阻塞一次事件循环。
+    store.append(full)
   }
 
   /**
@@ -193,7 +193,8 @@ export function apply(ctx: Context) {
     base.runId = RUN_ID
     const full = base as unknown as ActivityRow
     rows.push(full)
-    if (rows.length > MAX_ROWS) rows.splice(0, rows.length - MAX_ROWS)
+    if (rows.length > cfg.maxRows) rows.splice(0, rows.length - cfg.maxRows)
+    noteRowInTurn(full.sessionId, full.turn, full.seq)
     if (settled) persist(full)
     return full
   }
@@ -215,32 +216,38 @@ export function apply(ctx: Context) {
       ;(next as any).seq = ++seq
       ;(next as any).rev = 0
       rows.push(next)
-      if (rows.length > MAX_ROWS) rows.splice(0, rows.length - MAX_ROWS)
+      if (rows.length > cfg.maxRows) rows.splice(0, rows.length - cfg.maxRows)
+      // 被挤出后又补一条：这条新行也要重新进轮次的首次/末次登记
+      noteRowInTurn(next.sessionId, next.turn, next.seq)
     }
     if (settled) persist(next)
     return next
   }
 
   /**
-   * 补轮次边界标记（读出时算，不改写已落盘的行）：
-   * turnStart = 该 (session, turn) 的第一行（用户消息触发的第一次模型调用）
-   * turnEnd   = 该轮最后一行且该轮已结束（历史数据视为已结束）
+   * 给要下发的行补轮次边界标记并压成轻行（协议 v2）。
+   * 标记先在**全量**行上算（all），再套到目标行（target）—— 首/末行的判定不能被会话过滤
+   * 或分页截断改变：末行可能根本不在这批里，而它的标记已经进了 marks 日志。
+   * v1 的做法是直接把 turnStart/turnEnd 写进每条下发行的 `any[]` 里，且必须整表重算。
    */
-  function withTurnMarks(list: ActivityRow[], historical: boolean): any[] {
-    const first = new Map<string, number>()
-    const last = new Map<string, number>()
-    for (const r of list) {
-      if (!r.turn) continue
-      const k = `${r.sessionId ?? ''}|${r.turn}`
-      if (!first.has(k)) first.set(k, r.seq)
-      last.set(k, r.seq)
-    }
-    return list.map((r) => {
-      if (!r.turn) return r
-      const k = `${r.sessionId ?? ''}|${r.turn}`
-      const closed = historical || (closedTurns.get(r.sessionId ?? '')?.has(r.turn) ?? false)
-      return { ...r, turnStart: first.get(k) === r.seq, turnEnd: closed && last.get(k) === r.seq }
-    })
+  function lightRows(all: ActivityRow[], target: ActivityRow[]): LightRow[] {
+    return applyMarks(target.map(toLight), computeMarks(all, isTurnClosed))
+  }
+
+  /** 历史行的标记：历史一律视为「已结束」，同一套计算保证与实时口径一致 */
+  function historyLightRows(all: ActivityRow[], target: ActivityRow[]): LightRow[] {
+    return applyMarks(target.map(toLight), computeMarks(all, () => true))
+  }
+
+  /** 统一 JSON 响应（快照/详情/配置/自检共用） */
+  function sendJson(res: any, body: unknown, code = 200): void {
+    res.writeHead(code, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+    res.end(JSON.stringify(body))
+  }
+  /** 参数不合法：记进 self.badRequests（排查客户端与我方协议不一致） */
+  function sendBadRequest(res: any, text: string): void {
+    self.badRequests++
+    sendJson(res, { v: PROTOCOL, error: text }, 400)
   }
 
   /** skill name → 文件路径缓存（skill 工具调用时填充；也定期刷新清单） */
@@ -346,7 +353,7 @@ export function apply(ctx: Context) {
       settled: false,
       detail: [
         '── 参数 ──',
-        clampText(JSON.stringify(args, null, 2), TOOL_DETAIL_BUDGET_BYTES),
+        clampText(JSON.stringify(args, null, 2), cfg.toolDetailBudgetBytes),
         '── 结果 ──',
         '（执行中…）',
       ].join('\n'),
@@ -366,20 +373,24 @@ export function apply(ctx: Context) {
         const v = (result as any)?.value
         if (v != null) resultText = typeof v === 'string' ? v : JSON.stringify(v)
       }
-      if ((result as any)?.isError) {
-        resultText = resultText || String((result as any)?.error?.message ?? 'tool error')
+      const isErr = !!(result as any)?.isError
+      if (isErr) {
+        resultText = resultText || String((result as any)?.error?.message ?? '')
       }
       updateRow(pending, {
         ...common,
         durationMs: Date.now() - start,
-        ok: !(result as any)?.isError,
+        ok: !isErr,
+        // 失败签名在钩子内当场算：这里才拿得到结构化错误（isError / error.message）。
+        // 事后从 detail 那段「参数 + 结果」散文里反解会脆（还带预算截断），见 docs §3.1。
+        ...(isErr ? { failSig: failureSig(exec.name, resultText ? 'error' : 'no-output', resultText) } : {}),
         // 默认折叠；参数与结果都不再按 3000 字截断，只受总量上限保护（超出会标注）
         detail: [
           '── 参数 ──',
-          clampText(JSON.stringify(args, null, 2), TOOL_DETAIL_BUDGET_BYTES),
+          clampText(JSON.stringify(args, null, 2), cfg.toolDetailBudgetBytes),
           '── 结果 ──',
           resultText
-            ? clampText(resultText, TOOL_DETAIL_BUDGET_BYTES)
+            ? clampText(resultText, cfg.toolDetailBudgetBytes)
             : '（工具未返回文本结果）',
         ].join('\n'),
       })
@@ -389,6 +400,8 @@ export function apply(ctx: Context) {
         ...common,
         durationMs: Date.now() - start,
         ok: false,
+        // 抛异常与 isError 是两类失败：用 errClass 区分，别把两类失败聚成一簇
+        failSig: failureSig(exec.name, 'exception', String(err?.message ?? err)),
         detail: [
           '── 参数 ──',
           JSON.stringify(args, null, 2),
@@ -582,76 +595,202 @@ export function apply(ctx: Context) {
           contextMessages: ctx.messageCount,
           toolBytes: ctx.toolBytes,
           contextOmitted: ctx.omitted,
+          // 提示词分段数：轻行也带它（前端做跨轮差异与「提示词膨胀」信号用）
+          promptSections: promptSections.length,
         })
       }
     }
   })
 
-  // ── 快照端点 ──
-  // 历史会话列表 + 会话监控历史查询
-  ctx.effect(() => (ctx as any).webServer.register({
+  // ── HTTP 端点（协议 v2） ──
+  // 一屏说明：快照只传「轻行」（**不含正文**）。实测单行平均 15KB、最坏 265KB，其中约 85%
+  // 是 system prompt 与完整上下文正文 —— 那是高频通道里最重、定稿后最不变的数据。
+  // 正文改为展开某一行时才用 /row 取；轮次边界标记走 marks 日志增量。
+  if (cfg.endpoints) ctx.effect(() => (ctx as any).webServer.register({
     kind: 'exact' as const,
     path: '/api/activity-monitor/history',
     handler: async (req: any, res: any) => {
-      const url = new URL(req.url ?? '/', 'http://localhost')
-      const sid = url.searchParams.get('sessionId')
-      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
-      if (!sid) {
-        // 列出所有有监控历史的 session
-        try {
-          const files = readdirSync(HISTORY_DIR)
-          const sessions = files
-            .filter((f) => f.endsWith('.jsonl'))
-            .map((f) => {
-              const id = f.replace(/\.jsonl$/, '')
-              let count = 0
-              let lastTs = 0
-              try {
-                const content = readFileSync(path.join(HISTORY_DIR, f), 'utf8')
-                for (const line of content.split('\n')) {
-                  if (!line.trim()) continue
-                  count++
-                  try { lastTs = Math.max(lastTs, JSON.parse(line).ts ?? 0) } catch { /* skip */ }
-                }
-              } catch { /* ignore */ }
-              return { sessionId: id === 'global' ? null : id, count, lastTs }
-            })
-            .sort((a, b) => b.lastTs - a.lastTs)
-          res.end(JSON.stringify({ sessions }))
-        } catch {
-          res.end(JSON.stringify({ sessions: [] }))
+      try {
+        self.requests++
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        const sid = url.searchParams.get('sessionId')
+        if (!sid) {
+          // 会话列表：读索引（v1 是每个文件整篇读一遍，只为数行数与取末次时间 —— O(全库字节)）
+          return sendJson(res, {
+            v: PROTOCOL,
+            sessions: store.list().map((s) => ({ sessionId: s.sessionId, rows: s.rows, count: s.rows, lastTs: s.lastTs, bytes: s.bytes, archived: s.archived })),
+          })
         }
-      } else {
-        // 读取指定 session 的完整监控历史（时间正序）
-        const file = path.join(HISTORY_DIR, `${sid.replace(/[^a-zA-Z0-9._-]/g, '_')}.jsonl`)
-        const out: any[] = []
-        try {
-          const content = readFileSync(file, 'utf8')
-          for (const line of content.split('\n')) {
-            if (!line.trim()) continue
-            try { out.push(JSON.parse(line)) } catch { /* skip */ }
-          }
-        } catch { /* 无历史 */ }
-        res.end(JSON.stringify({ sessionId: sid, rows: withTurnMarks(out, true), total: out.length }))
+        const read = store.rows(sid)
+        const all = read.rows
+        const light = url.searchParams.get('light') === '1'
+        const limit = Math.max(1, Math.min(20_000, Number(url.searchParams.get('limit') ?? cfg.client.backfillRows) || cfg.client.backfillRows))
+        const before = Number(url.searchParams.get('before') ?? 0) || 0
+        // before = 面板已有行里最旧的 ts：往更早翻一页（分页，避免一次把整段历史搬进浏览器）
+        const win = before > 0 ? all.filter((r) => (r.ts ?? 0) < before) : all
+        const slice = win.length > limit ? win.slice(-limit) : win
+        sendJson(res, {
+          v: PROTOCOL,
+          sessionId: sid,
+          total: all.length,
+          returned: slice.length,
+          truncated: win.length > slice.length,
+          archived: read.archived,
+          badLines: read.badLines,
+          // light=1（v2 客户端）：轻行 + 本页涉及的轮次标记；
+          // 缺省继续保持 v1 的整行下发（带 turnStart/turnEnd），让旧客户端不至于打不开面板。
+          rows: light
+            ? historyLightRows(all, slice)
+            : applyMarks(slice as Array<ActivityRow & { turnStart?: boolean; turnEnd?: boolean }>, computeMarks(all, () => true)),
+        })
+      } catch (e) {
+        noteError(e)
+        sendJson(res, { v: PROTOCOL, error: String((e as any)?.message ?? e) }, 500)
       }
     },
   }), 'activity-monitor: history route')
 
-  ctx.effect(() => (ctx as any).webServer.register({
+  if (cfg.endpoints) ctx.effect(() => (ctx as any).webServer.register({
     kind: 'exact' as const,
     path: '/api/activity-monitor/snapshot',
     handler: async (req: any, res: any) => {
-      const url = new URL(req.url ?? '/', 'http://localhost')
-      const since = Number(url.searchParams.get('since') ?? 0)
-      const fresh = rows.filter((r) => r.seq > since)
-      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
-      res.end(JSON.stringify({
-        now: Date.now(),
-        rows: withTurnMarks(fresh, false),
-        total: rows.length,
-      }))
+      try {
+        self.requests++
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        const since = Number(url.searchParams.get('since') ?? 0) || 0
+        const markSince = Number(url.searchParams.get('markSince') ?? 0) || 0
+        const sessionId = url.searchParams.get('sessionId')
+        // 会话过滤在服务端做：面板只关心当前会话（与无会话归属的行），别的会话的行不必下发
+        const scoped = sessionId ? rows.filter((r) => r.sessionId === sessionId || !r.sessionId) : rows
+        const delta = scoped.filter((r) => r.seq > since)
+        const log = markLog.since(markSince)
+        sendJson(res, {
+          v: PROTOCOL,
+          runId: RUN_ID,
+          now: Date.now(),
+          total: scoped.length,
+          /** 全局发号游标：客户端用它推进 since（跨会话共享同一个计数器） */
+          lastSeq: seq,
+          markGen: log.markGen,
+          /** 客户端游标落在已被容量丢弃的区间 → 它应整段重载 */
+          marksTooOld: log.tooOld,
+          /** 客户端游标比宿主还新（宿主重启过）→ 让它重开一轮增量 */
+          marksReset: log.reset,
+          marks: log.entries,
+          rows: lightRows(scoped, delta),
+        })
+      } catch (e) {
+        noteError(e)
+        sendJson(res, { v: PROTOCOL, error: String((e as any)?.message ?? e) }, 500)
+      }
     },
   }), 'activity-monitor: snapshot route')
+
+  // 单行正文（重体）端点：前端展开某一行时才调用。先查内存环形缓冲（进行中的行只有内存里
+  // 有），未命中再回落到历史文件（含 .jsonl.gz，走 HistoryStore 的解析缓存）。
+  if (cfg.endpoints) ctx.effect(() => (ctx as any).webServer.register({
+    kind: 'exact' as const,
+    path: '/api/activity-monitor/row',
+    handler: async (req: any, res: any) => {
+      try {
+        self.requests++
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        const sessionId = url.searchParams.get('sessionId')
+        const wantSeq = Number(url.searchParams.get('seq') ?? 0)
+        const ts = Number(url.searchParams.get('ts') ?? 0)
+        if (!wantSeq || !ts) return sendBadRequest(res, 'seq 与 ts 必填（seq 可能被环形缓冲重排，用 ts 消歧）')
+        const live = rows.find((r) => r.seq === wantSeq && r.ts === ts)
+        if (live && (live.detail || (live.sections?.length ?? 0) > 0)) {
+          self.rowBodyHits++
+          return sendJson(res, { v: PROTOCOL, row: { seq: live.seq, ts: live.ts, rev: live.rev, detail: live.detail, sections: live.sections } })
+        }
+        // 内存里没有（已被挤出缓冲 / 是历史行）：走磁盘。
+        // 命中口径：hits = 真的取回了正文（内存或磁盘）；misses = 真的没有（404）。
+        // 之前的写法把「磁盘成功」也计进 misses，/selfcheck 上看着像全失败，误导排查。
+        const fromDisk = store.row(sessionId, wantSeq, ts)
+        if (!fromDisk) {
+          self.rowBodyMisses++
+          return sendJson(res, { v: PROTOCOL, row: null }, 404)
+        }
+        self.rowBodyHits++
+        sendJson(res, { v: PROTOCOL, row: { seq: wantSeq, ts, ...fromDisk } })
+      } catch (e) {
+        noteError(e)
+        sendJson(res, { v: PROTOCOL, error: String((e as any)?.message ?? e) }, 500)
+      }
+    },
+  }), 'activity-monitor: row route')
+
+  // 生效配置（客户端据此决定轮询节奏与保留行数；缺省值与 host 完全同源，避免两边各写一份）
+  // client 子对象单独摊平发出去：浏览器侧只用这几个旋钮，不必理解宿主侧的完整配置结构
+  if (cfg.endpoints) ctx.effect(() => (ctx as any).webServer.register({
+    kind: 'exact' as const,
+    path: '/api/activity-monitor/config',
+    handler: async (_req: any, res: any) => {
+      sendJson(res, { v: PROTOCOL, config: cfg, client: cfg.client })
+    },
+  }), 'activity-monitor: config route')
+
+  // 自检端点：排查「面板没数据 / 历史没落盘 / 归档没跑」时的第一入口
+  if (cfg.endpoints) ctx.effect(() => (ctx as any).webServer.register({
+    kind: 'exact' as const,
+    path: '/api/activity-monitor/selfcheck',
+    handler: async (_req: any, res: any) => {
+      try {
+        const sessions = store.list()
+        sendJson(res, {
+          v: PROTOCOL,
+          runId: RUN_ID,
+          uptimeMs: Date.now() - self.startedAt,
+          rowsInBuffer: rows.length,
+          inFlight: rows.filter((r) => r.settled === false).length,
+          lastSeq: seq,
+          markGen: markLog.generation,
+          sessions: sessions.length,
+          history: {
+            dir: cfg.history.dir,
+            sessions: sessions.slice(0, 20),
+            ...store.stats(),
+          },
+          endpoint: {
+            requests: self.requests,
+            badRequests: self.badRequests,
+            errors: self.endpointErrors,
+            rowBodyHits: self.rowBodyHits,
+            rowBodyMisses: self.rowBodyMisses,
+            lastError: self.lastError,
+          },
+          config: {
+            maxRows: cfg.maxRows,
+            contextBudgetBytes: cfg.contextBudgetBytes,
+            toolDetailBudgetBytes: cfg.toolDetailBudgetBytes,
+            archiveAfterDays: cfg.history.archiveAfterDays,
+            endpoints: cfg.endpoints,
+            client: cfg.client,
+            issues: cfg.issues,
+          },
+        })
+      } catch (e) {
+        noteError(e)
+        sendJson(res, { v: PROTOCOL, error: String((e as any)?.message ?? e) }, 500)
+      }
+    },
+  }), 'activity-monitor: selfcheck route')
+
+  // ── 历史归档（保留策略） ──
+  // 超过 archiveAfterDays 的会话文件自动 gzip 归档（0 = 关闭）。原文不丢：内容完整地在
+  // .jsonl.gz 里，读取路径（/history、/row、activity_report）对归档文件透明。
+  const runArchive = (): void => {
+    try {
+      const r = store.archiveOld()
+      if (r.archived > 0) {
+        ctx.logger.info(`[activity-monitor] 已归档 ${r.archived} 个历史文件（超过 ${cfg.history.archiveAfterDays} 天的会话）`)
+      }
+    } catch (e) { noteError(e) }
+  }
+  const firstArchive = setTimeout(runArchive, 10_000)
+  const archiveTimer = setInterval(runArchive, Math.max(1, cfg.history.archiveCheckHours) * 3_600_000)
+  ctx.effect(() => () => { clearTimeout(firstArchive); clearInterval(archiveTimer) }, 'activity-monitor: history archiver')
 
   // ── agent 侧：activity_report 工具（agent 自查监控数据） ──
   // 懒注册：仅当 tools 服务存在时才装载（子 fiber 延迟注入；缺服务则停留 PENDING，
@@ -684,6 +823,8 @@ export function apply(ctx: Context) {
       },
     })
     let disposer: (() => void) | undefined
+    let verdictDisposer: (() => void) | undefined
+    let proposalDisposer: (() => void) | undefined
     void (async () => {
       const { defineTool } = await import('@deepseek-ai/dsh-tools')
       // parameters 用 spec 形式（编译器生成给模型看的 JSON Schema）；
@@ -693,7 +834,8 @@ export function apply(ctx: Context) {
         name: 'activity_report',
         description:
           '查询本次会话（或指定会话）的活动监控报告：模型/工具调用量、token 用量、耗时、' +
-          '各工具调用频次与失败、上下文相对预算的压力与是否被截断、近期明细，以及一组陈述性 signals。' +
+          '各工具调用频次与失败、失败聚类（同一失败签名重复几次）、任务验收结论（verdict）、' +
+          '上下文相对预算的压力与是否被截断、近期明细，以及一组陈述性 signals。' +
           '只陈述观察到的事实与阈值判断，不替你决策——你据此自行判断是否换路 / 压缩 / 重开会话 / 降低重复。' +
           '在长任务、批量重试、上下文逼近上限时调用它自查。',
         parameters: {
@@ -704,6 +846,18 @@ export function apply(ctx: Context) {
           recentTurns: {
             type: 'number',
             description: '只统计最近 N 个轮次（按轮次号取最大的 N）；缺省 = 该范围全量。',
+          },
+          maxFailures: {
+            type: 'number',
+            description: 'failures 明细最多返回多少条（默认 20）。聚类 failureClusters 不受它影响，始终覆盖全部失败。',
+          },
+          clusterMinCount: {
+            type: 'number',
+            description: '失败聚类的最小重复次数（默认 2，下限 2）：同一失败签名达到该次数才进 failureClusters。',
+          },
+          skillWindowTurns: {
+            type: 'number',
+            description: '技能前后对比的窗口轮数（默认 3）：取该技能首次加载轮次的前后各 N 轮做指标对比。',
           },
         },
         output: {
@@ -734,6 +888,45 @@ export function apply(ctx: Context) {
             if (r.tools.byName.length) {
               lines.push('工具频次：' + r.tools.byName.map((e) => `${e.name}×${e.count}${e.failed ? `(失败${e.failed})` : ''}`).join('，'))
             }
+            if (r.failureClusters?.length) {
+              lines.push('失败聚类（同一签名按次数降序）：')
+              for (const c of r.failureClusters.slice(0, 8)) {
+                lines.push(`  ${c.count}× ${c.tool}/${c.errClass} · ${c.turns.length} 个轮次 · 样本 seq ${c.exampleSeqs.join(',')} — ${c.sig}`)
+              }
+            }
+            if (r.failuresTruncated) {
+              lines.push(`注：failures 明细只列前 ${r.failuresTruncated.shown} 条（共 ${r.failuresTruncated.total} 条）`)
+            }
+            if (r.lastVerdict) {
+              lines.push(`验收结论：${r.lastVerdict.status} — ${r.lastVerdict.basis}（seq ${r.lastVerdict.seq}）`)
+            } else if (r.likelyOutcome) {
+              lines.push(`验收结论：无（过程推断 ${r.likelyOutcome.label}，置信度 low，非验收结论）`)
+            }
+            if (r.toolOutcome?.length) {
+              // 只列「有问题」或「有结论可依」的行，避免把报告撑成工具清单
+              const notable = r.toolOutcome.filter((e) => e.failed > 0 || e.retriedInTurn > 0 || e.inTurnWithVerdictFail > 0).slice(0, 6)
+              if (notable.length) {
+                lines.push('工具同现统计（不是因果：只说该工具出现在哪类轮次里）：')
+                for (const e of notable) {
+                  lines.push(`  ${e.name}：调用 ${e.calls} · 失败 ${e.failed} · 同轮重试 ${e.retriedInTurn} · 末轮 ${e.inFinalTurn} · 带 pass 验收 ${e.inTurnWithVerdictPass} · 带 fail 验收 ${e.inTurnWithVerdictFail}`)
+                }
+              }
+            }
+            if (r.skillEffect?.length) {
+              const fmtWin = (w?: { turns: number; toolCalls: number; failedCalls: number; inputTokens: number }): string =>
+                w ? `轮 ${w.turns}/工具 ${w.toolCalls}/失败 ${w.failedCalls}/输入 ${w.inputTokens}` : '（无数据）'
+              lines.push('技能加载前后窗口对比（无对照组，只能当线索）：')
+              for (const s of r.skillEffect.slice(0, 6)) {
+                lines.push(`  ${s.name}（加载 ${s.loads} 次）：前 ${fmtWin(s.windowBefore)} → 后 ${fmtWin(s.windowAfter)}`)
+              }
+            }
+            if (r.proposals?.length) {
+              lines.push(`进化提案：共 ${r.proposals.length} 条，待人工批准 ${r.pendingProposals} 条（本插件只写提案，不执行任何变更）`)
+              for (const p of r.proposals.slice(-5)) {
+                const ev = p.evidenceSeqs.length ? ` · 证据行 ${p.evidenceSeqs.join(',')}` : ''
+                lines.push(`  #${p.seq} ${p.pkind}/${p.action} ${p.target} · ${p.status}${ev}`)
+              }
+            }
             if (r.context.lastContextBytes != null) {
               lines.push(`上下文：${r.context.note}`)
             }
@@ -754,15 +947,15 @@ export function apply(ctx: Context) {
           },
         },
         async execute(args: any, exec: any) {
-          const a = (args ?? {}) as { sessionId?: unknown; recentTurns?: unknown }
+          const a = (args ?? {}) as { sessionId?: unknown; recentTurns?: unknown; maxFailures?: unknown; clusterMinCount?: unknown; skillWindowTurns?: unknown }
           const agentSid = exec?.agent?.session?.id != null ? String(exec.agent.session.id) : undefined
           const explicit = typeof a.sessionId === 'string' && a.sessionId ? a.sessionId : undefined
           let rowsAll: ActivityRow[]
           if (explicit === undefined && agentSid !== undefined) {
-            // 当前会话：内存过滤 + 该会话历史 JSONL 合并（补回被环形缓冲挤出的旧行）
-            rowsAll = mergeActivityRows(rows.filter((rr) => rr.sessionId === agentSid), loadHistoryRows(agentSid))
+            // 当前会话：内存过滤 + 该会话历史行合并（补回被环形缓冲挤出的旧行）
+            rowsAll = mergeActivityRows(rows.filter((rr) => rr.sessionId === agentSid), loadHistoryRows(store, agentSid))
           } else if (explicit) {
-            rowsAll = mergeActivityRows(rows.filter((rr) => rr.sessionId === explicit), loadHistoryRows(explicit))
+            rowsAll = mergeActivityRows(rows.filter((rr) => rr.sessionId === explicit), loadHistoryRows(store, explicit))
           } else {
             rowsAll = rows // 无会话：统计全量内存缓冲
           }
@@ -774,12 +967,283 @@ export function apply(ctx: Context) {
               sessionId: explicit ?? agentSid ?? null,
               contextBudgetBytes: CONTEXT_BUDGET_BYTES,
               recentTurns: typeof a.recentTurns === 'number' && a.recentTurns > 0 ? Math.floor(a.recentTurns) : undefined,
+              maxFailures: typeof a.maxFailures === 'number' && a.maxFailures > 0 ? Math.floor(a.maxFailures) : undefined,
+              clusterMinCount: typeof a.clusterMinCount === 'number' && a.clusterMinCount > 0 ? Math.floor(a.clusterMinCount) : undefined,
+              skillWindowTurns: typeof a.skillWindowTurns === 'number' && a.skillWindowTurns > 0 ? Math.floor(a.skillWindowTurns) : undefined,
             }) as any,
           }
         },
       })
       disposer = tools.register(def)
       subCtx.logger?.info?.('[activity-monitor] agent 报告工具 activity_report 已注册（agent 可自查 token/工具/失败/上下文压力）')
+
+      // ── 第二个工具：task_verdict —— 本插件唯一的「写」入口（agent 写入验收结论） ──
+      // 它只记录、不执行任何命令：验收命令请用普通工具（bash 等）跑，再用 evidenceSeqs/verifySeqs
+      // 引用那几条工具行的 seq 当证据 —— 于是「验收结论 → 证据行 → 命令」可追，而插件不获得执行权。
+      // 记录成一行 kind:'verdict'（与普通调用同一份 JSONL / 时间轴 / 归档），刻意不带 durationMs、
+      // 不打 ok：报告侧 failedCalls 的口径是「任意 kind 的 ok === false」，用 ok 表达验收失败会污染失败统计。
+      const VERDICT_STATUSES = ['pass', 'fail', 'partial', 'unknown'] as const
+      const verdictDef = defineTool({
+        name: 'task_verdict',
+        description:
+          '记录一次任务/子任务的验收结论（pass|fail|partial|unknown）与依据，作为 agent 自我进化的结果数据。' +
+          '只记录事实、不执行任何命令：验收命令请用普通工具（如 bash）执行，再用 evidenceSeqs/verifySeqs ' +
+          '引用那几条工具行的 seq 当证据。任务自认为收敛、验收失败需要留痕、长任务阶段性收尾时调用它。',
+        parameters: {
+          status: {
+            type: 'string',
+            enum: VERDICT_STATUSES,
+            required: true,
+            description: '验收结论：pass 通过 | fail 未通过 | partial 部分通过 | unknown 无法判定',
+          },
+          basis: {
+            type: 'string',
+            required: true,
+            description: '结论依据（一句话事实，≤500 字）：凭什么判定，例如「npm test 全绿」或「类型检查报 3 处错误」。',
+          },
+          evidenceSeqs: {
+            type: 'array',
+            items: { type: 'number' },
+            description: '作为证据的工具行 seq 列表（可选）：验收命令那条行、或失败的工具行。',
+          },
+          verifyCommand: {
+            type: 'string',
+            description: '本次使用的验收命令原文（可选）—— 只记录文本，本插件不执行它。',
+          },
+          verifySeqs: {
+            type: 'array',
+            items: { type: 'number' },
+            description: '上述验收命令对应的工具行 seq（可选）。',
+          },
+        },
+        output: {
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              verdict: { type: 'json' },
+            },
+          },
+          render: (_args: any, value: any) => {
+            const v = value?.verdict
+            return [{ type: 'text', text: v ? `已记录验收结论：${v.status} — ${v.basis}（行 seq ${v.seq}）` : '（未记录）' }]
+          },
+        },
+        // 必须 async：dsh-tools 的 execute 约定返回 Promise（同步返回会被类型拒绝）
+        async execute(args: any, exec: any) {
+          const a = (args ?? {}) as Record<string, unknown>
+          const status = String(a.status ?? '')
+          if (!(VERDICT_STATUSES as readonly string[]).includes(status)) {
+            // 编译后的参数 schema 已用 enum 拦过一次，这里是兜底：非法值绝不落盘
+            throw new Error(`task_verdict: status 必须是 ${VERDICT_STATUSES.join('|')} 之一，收到 ${JSON.stringify(a.status)}`)
+          }
+          const basis = String(a.basis ?? '').trim().slice(0, 500)
+          if (!basis) throw new Error('task_verdict: basis 不能为空（写清依据什么判定）')
+          const seqsOf = (v: unknown): number[] | undefined => {
+            if (!Array.isArray(v)) return undefined
+            const out = v.filter((n): n is number => typeof n === 'number' && Number.isFinite(n)).map((n) => Math.floor(n))
+            return out.length ? out : undefined
+          }
+          const evidenceSeqs = seqsOf(a.evidenceSeqs)
+          const verifySeqs = seqsOf(a.verifySeqs)
+          const verifyCommand = typeof a.verifyCommand === 'string' && a.verifyCommand.trim()
+            ? a.verifyCommand.trim().slice(0, 500)
+            : undefined
+          const sessionId = exec?.agent?.session?.id != null ? String(exec.agent.session.id) : undefined
+          const row = record({
+            kind: 'verdict',
+            sessionId,
+            name: 'task_verdict',
+            tag: 'verdict',
+            summary: basis.slice(0, 120),
+            detail: [
+              '── 结论 ──',
+              status,
+              '── 依据 ──',
+              basis,
+              '── 证据行 ──',
+              evidenceSeqs ? evidenceSeqs.join(', ') : '（未指定）',
+              '── 验收命令 ──',
+              verifyCommand ?? '（未指定）',
+              verifySeqs ? `（命令所在行：${verifySeqs.join(', ')}）` : '',
+            ].filter((x) => x !== '').join('\n'),
+            verdict: { status: status as (typeof VERDICT_STATUSES)[number], basis, evidenceSeqs, verifyCommand, verifySeqs, by: 'agent', at: Date.now() },
+          })
+          subCtx.logger?.info?.(`[activity-monitor] 已记录验收结论 ${status}（seq ${row.seq}）`)
+          return {
+            verdict: {
+              seq: row.seq, ts: row.ts, sessionId: sessionId ?? null, status, basis,
+              evidenceSeqs: evidenceSeqs ?? [], verifyCommand: verifyCommand ?? null, verifySeqs: verifySeqs ?? [],
+            },
+          }
+        },
+      })
+      verdictDisposer = tools.register(verdictDef)
+
+      // ── 第三个工具：evolution_proposal —— 进化提案入口（L6） ──
+      // 纪律：**只写提案，不执行任何变更**（不装插件、不建 skill、不重启进程）。
+      // 执行由人批准后走既有执行器（dshmarket 的安装/热停用、skills-manager 的创建），
+      // 见 docs/agent-evolution-data.md §10 —— 本插件不获得执行权。
+      // status 刻意不是参数：agent 只能写 'proposed'，绝不接受 'applied'/'approved'，
+      // 否则等于允许模型自己伪造「已执行」记录。
+      const PROPOSAL_KINDS = ['skill', 'plugin', 'automation'] as const
+      const PROPOSAL_ACTIONS = ['create', 'install', 'enable', 'disable', 'remove', 'other'] as const
+      const proposalDef = defineTool({
+        name: 'evolution_proposal',
+        description:
+          '把一条「该学什么 / 该装什么 / 该停用什么」写成可审阅的提案，作为自我进化的动作面入口。' +
+          '**只记录提案、不执行任何变更**（不装插件、不建技能、不重启）：执行需人工批准后走既有执行器。' +
+          '提案要能指回证据（evidenceSeqs 引用真实工具行），并给出可测的期望效果与回滚方案。',
+        parameters: {
+          pkind: {
+            type: 'string',
+            enum: PROPOSAL_KINDS,
+            required: true,
+            description: '提案类别：skill 技能 | plugin 插件 | automation 自动化',
+          },
+          action: {
+            type: 'string',
+            enum: PROPOSAL_ACTIONS,
+            required: true,
+            description: '建议动作：create 新建 | install 安装 | enable 启用 | disable 停用 | remove 卸载 | other',
+          },
+          target: {
+            type: 'string',
+            required: true,
+            description: '目标：技能名 / 插件包名 / 仓库（≤200 字）。',
+          },
+          rationale: {
+            type: 'string',
+            required: true,
+            description: '为什么提这条（≤500 字）：必须来自可指回的证据（失败簇 / 验收结论 / 工具同现统计）。',
+          },
+          evidenceSeqs: {
+            type: 'array',
+            items: { type: 'number' },
+            description: '支撑本提案的工具行 seq 列表（可选但强烈建议）—— 便于人核对依据。',
+          },
+          expectedEffect: {
+            type: 'string',
+            description: '期望改善的**可测**指标（可选），例如「同一失败签名 7 天内归零」。',
+          },
+          verifyCommands: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '验收命令原文列表（可选）—— 只记录文本，本插件不执行它。',
+          },
+          rollbackPlan: {
+            type: 'string',
+            description: '回滚方案（可选）：怎么撤回这次变更（本插件不执行回滚，只记录方案）。',
+          },
+        },
+        output: {
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              proposal: { type: 'json' },
+            },
+          },
+          render: (_args: any, value: any) => {
+            const p = value?.proposal
+            return [{
+              type: 'text',
+              text: p
+                ? `已记录提案 #${p.seq}：${p.pkind}/${p.action} ${p.target} —— status=proposed（待人工批准；本插件不执行变更）`
+                : '（未记录）',
+            }]
+          },
+        },
+        // 必须 async：dsh-tools 的 execute 约定返回 Promise
+        async execute(args: any, exec: any) {
+          const a = (args ?? {}) as Record<string, unknown>
+          const pkind = String(a.pkind ?? '')
+          if (!(PROPOSAL_KINDS as readonly string[]).includes(pkind)) {
+            throw new Error(`evolution_proposal: pkind 必须是 ${PROPOSAL_KINDS.join('|')} 之一，收到 ${JSON.stringify(a.pkind)}`)
+          }
+          const action = String(a.action ?? '')
+          if (!(PROPOSAL_ACTIONS as readonly string[]).includes(action)) {
+            throw new Error(`evolution_proposal: action 必须是 ${PROPOSAL_ACTIONS.join('|')} 之一，收到 ${JSON.stringify(a.action)}`)
+          }
+          const target = String(a.target ?? '').trim().slice(0, 200)
+          if (!target) throw new Error('evolution_proposal: target 不能为空')
+          const rationale = String(a.rationale ?? '').trim().slice(0, 500)
+          if (!rationale) throw new Error('evolution_proposal: rationale 不能为空（写清依据）')
+          const seqsOf = (v: unknown): number[] | undefined => {
+            if (!Array.isArray(v)) return undefined
+            const out = v.filter((n): n is number => typeof n === 'number' && Number.isFinite(n)).map((n) => Math.floor(n))
+            return out.length ? out : undefined
+          }
+          const strsOf = (v: unknown): string[] | undefined => {
+            if (!Array.isArray(v)) return undefined
+            const out = v.filter((x): x is string => typeof x === 'string' && x.trim() !== '').map((x) => x.trim().slice(0, 500))
+            return out.length ? out : undefined
+          }
+          const trimmed = (v: unknown): string | undefined =>
+            typeof v === 'string' && v.trim() ? v.trim().slice(0, 500) : undefined
+          const sessionId = exec?.agent?.session?.id != null ? String(exec.agent.session.id) : undefined
+          const proposal = {
+            pkind: pkind as (typeof PROPOSAL_KINDS)[number],
+            action: action as (typeof PROPOSAL_ACTIONS)[number],
+            target,
+            rationale,
+            evidenceSeqs: seqsOf(a.evidenceSeqs),
+            expectedEffect: trimmed(a.expectedEffect),
+            verifyCommands: strsOf(a.verifyCommands),
+            rollbackPlan: trimmed(a.rollbackPlan),
+            status: 'proposed' as const,
+            by: 'agent' as const,
+            at: Date.now(),
+          }
+          const row = record({
+            kind: 'proposal',
+            sessionId,
+            name: 'evolution_proposal',
+            tag: 'proposal',
+            summary: `${pkind}/${action} ${target} · ${proposal.status}`,
+            detail: [
+              '── 提案 ──',
+              `${pkind} / ${action}`,
+              target,
+              '── 理由 ──',
+              rationale,
+              '── 期望效果 ──',
+              proposal.expectedEffect ?? '（未指定）',
+              '── 回滚方案 ──',
+              proposal.rollbackPlan ?? '（未指定）',
+              '── 证据行 ──',
+              proposal.evidenceSeqs ? proposal.evidenceSeqs.join(', ') : '（未指定）',
+              '── 验收命令（仅记录，不执行） ──',
+              proposal.verifyCommands ? proposal.verifyCommands.join('\n') : '（未指定）',
+              '── 状态 ──',
+              `${proposal.status}（本插件只写提案、不执行变更：批准与执行由人通过 dshmarket / skills-manager 完成）`,
+            ].join('\n'),
+            proposal,
+          })
+          subCtx.logger?.info?.(`[activity-monitor] 已记录进化提案 #${row.seq}：${pkind}/${action} ${target}`)
+          // 返回值必须全是「已定义」的值：dsh-tools 的 JsonValue 不接受 undefined（与 task_verdict 同风格）
+          return {
+            proposal: {
+              seq: row.seq,
+              ts: row.ts,
+              sessionId: sessionId ?? null,
+              pkind: proposal.pkind,
+              action: proposal.action,
+              target: proposal.target,
+              rationale: proposal.rationale,
+              evidenceSeqs: proposal.evidenceSeqs ?? [],
+              expectedEffect: proposal.expectedEffect ?? null,
+              verifyCommands: proposal.verifyCommands ?? [],
+              rollbackPlan: proposal.rollbackPlan ?? null,
+              status: proposal.status,
+              by: proposal.by,
+              at: proposal.at,
+            },
+          }
+        },
+      })
+      proposalDisposer = tools.register(proposalDef)
+      subCtx.logger?.info?.('[activity-monitor] 进化提案工具 evolution_proposal 已注册（只写提案，不执行变更）')
     })().catch((err: any) => {
       // dsh-tools 缺失或注册失败：监控核心不受影响，仅不暴露工具；留痕便于排查
       subCtx.logger?.warn?.('[activity-monitor] activity_report 工具未注册：' + String(err?.message ?? err))
@@ -788,7 +1252,9 @@ export function apply(ctx: Context) {
     // 异步注册完成前卸载则为 undefined，跳过即可；disposer 幂等，可安全重复调用）
     subCtx.effect(() => () => {
       disposer?.()
-    }, 'activity-monitor: agent_report tool')
+      verdictDisposer?.()
+      proposalDisposer?.()
+    }, 'activity-monitor: agent_report + task_verdict + evolution_proposal tools')
   })
   void subFiber
 
@@ -824,13 +1290,15 @@ function clampText(s: string, maxBytes: number): string {
 
 // ── 发给模型的完整上下文（消息序列 + 工具清单） ──
 /**
- * 单条请求里「完整上下文 + 工具清单」的总字节预算。
+ * 单条请求里「完整上下文 + 工具清单」的总字节预算的**进程级默认值**。
  * 正文不截断，但总量封顶；超出时按「最旧优先」整条省略并标注（尾部才是本次真正生效的上下文）。
- * 这也是 agent_report 工具判断「上下文是否逼近/超出监控预算」的依据（CONTEXT_BUDGET_BYTES）。
+ * 这也是 activity_report 工具判断「上下文是否逼近/超出监控预算」的依据。
+ *
+ * 为什么是模块级可变：buildContextSections / buildAgentReport 都是纯函数（可单测、不持有 ctx），
+ * 预算由 apply() 在挂载时用 config 覆盖一次（config.contextBudgetBytes）。dsh 一个进程只挂一份
+ * profile，所以「进程级」在实践中等价于「实例级」；同一进程挂多份（测试场景）时以最后挂载者为准。
  */
-const CONTEXT_BUDGET_BYTES = 300 * 1024
-/** 单条工具结果的落盘上限（命令输出可能极大，避免把 JSONL 撑爆） */
-const TOOL_DETAIL_BUDGET_BYTES = 300 * 1024
+let CONTEXT_BUDGET_BYTES = 300 * 1024
 const byteLen = (s: string): number => Buffer.byteLength(s, 'utf8')
 const fmtBytes = (n: number): string => (n >= 1024 ? `${(n / 1024).toFixed(1)} KB` : `${n} B`)
 /** 取首个非空行做摘要 */
@@ -1074,6 +1542,85 @@ export interface AgentReport {
     duplicated: { name: string; count: number; failed: number }[]
   }
   readonly failures: { seq: number; ts: number; kind: string; name: string; summary: string }[]
+  /**
+   * 失败聚类（L1，只加不删）：按 failSig 把同类失败聚成一簇；failures 原样保留。
+   * 历史行没有 failSig（那时还没这个字段），归到 `${name}|legacy|…` 的单列簇，
+   * 不与真签名混算 —— 否则会凭空造出一个「重复失败」的假信号。
+   */
+  readonly failureClusters: {
+    sig: string
+    tool: string
+    errClass: string
+    count: number
+    /** 出现过的轮次号（升序） */
+    turns: number[]
+    firstSeq: number
+    lastSeq: number
+    /** 最多 3 条样本 seq，供 agent 用 /row 回查正文 */
+    exampleSeqs: number[]
+    /** 该签名首条样本的摘要（≤120 字） */
+    sampleSummary: string
+  }[]
+  /** failures 被上限截断时的提示；未截断则缺省（聚类不受上限影响，始终覆盖全部失败） */
+  readonly failuresTruncated?: { total: number; shown: number }
+  /** 验收结论行（kind === 'verdict'），按时间升序，最多 20 条 */
+  readonly verdicts: { seq: number; ts: number; status: string; basis: string; evidenceSeqs: number[] }[]
+  /** 最近一条验收结论；没有则缺省 */
+  readonly lastVerdict?: { seq: number; ts: number; status: string; basis: string }
+  /**
+   * 过程推断的「可能结果」——**只在没有任何验收结论时**给出，置信度固定 low。
+   * 它不是验收结论：有 verdict 时字段缺省（不猜），signals 里也会显式声明这一点。
+   */
+  readonly likelyOutcome?: { label: 'likely-pass' | 'likely-fail'; confidence: 'low'; reasons: string[] }
+  /**
+   * 工具级「同现」统计（L3）：某工具的调用出现在**什么样的轮次**里 —— 收敛轮（该会话本范围内
+   * 最后一轮）、重试轮（同轮内再次调用）、带验收结论的轮次（pass / fail）。
+   * **这是同现统计、不是因果推断**（没有对照组）：只能说「工具 X 出现在通过验收的轮次 N 次」，
+   * 不能说「工具 X 带来成功」。带 pass/fail 的两项依赖验收结论，没有 verdict 时恒为 0。
+   * 已剔除本插件自身工具（见自我观测剔除）。
+   */
+  readonly toolOutcome: {
+    name: string
+    calls: number
+    failed: number
+    /** 该工具行所在轮次 = 该会话（本范围内）的最后一轮 */
+    inFinalTurn: number
+    /** 同一轮内该工具被再次调用（第 2 次起累加） */
+    retriedInTurn: number
+    inTurnWithVerdictPass: number
+    inTurnWithVerdictFail: number
+  }[]
+  /** 技能加载（tag === 'skill' 的行）；名称取自 `summary: 'skill: <name>'` */
+  readonly skillLoads: { name: string; seq: number; ts: number; turn: number }[]
+  /**
+   * 技能加载前后窗口对比（L4）。**只做前后对比，不是 A/B**：没有对照组，且窗口内任务难度
+   * 也不同 —— 只能当「值得进一步验证」的线索。窗口内没有行时该项缺省（不填 0，
+   * 否则看起来像「这段时间没有任何活动」）。
+   */
+  readonly skillEffect: {
+    name: string
+    loads: number
+    windowBefore?: { turns: number; toolCalls: number; failedCalls: number; inputTokens: number }
+    windowAfter?: { turns: number; toolCalls: number; failedCalls: number; inputTokens: number }
+  }[]
+  /**
+   * 进化提案（L6）：agent 用 evolution_proposal 写下的提案行。**本插件只报数、不执行**：
+   * 批准与执行由人通过既有执行器（dshmarket / skills-manager）完成，见 docs §10。
+   * 提案状态只可能由人或显式写入推进，agent 侧工具永远只写 `proposed`。
+   */
+  readonly proposals: {
+    seq: number
+    ts: number
+    pkind: string
+    action: string
+    target: string
+    rationale: string
+    status: string
+    by: string
+    evidenceSeqs: number[]
+  }[]
+  /** 待人工批准（status === 'proposed'）的提案数 —— 只报数，不自动执行 */
+  readonly pendingProposals: number
   readonly context: {
     lastTurn?: number
     lastContextBytes?: number
@@ -1108,18 +1655,12 @@ function mergeActivityRows(mem: ActivityRow[], hist: ActivityRow[]): ActivityRow
   return [...m.values()].sort((a, b) => (a.ts - b.ts) || (a.seq - b.seq))
 }
 
-/** 读某会话的历史 JSONL → ActivityRow[]（按 ts 正序）。无文件 / 读失败 = 空。 */
-function loadHistoryRows(sessionKey: string): ActivityRow[] {
-  const out: ActivityRow[] = []
-  try {
-    const file = path.join(HISTORY_DIR, `${sessionKey.replace(/[^a-zA-Z0-9._-]/g, '_')}.jsonl`)
-    const content = readFileSync(file, 'utf8')
-    for (const line of content.split('\n')) {
-      if (!line.trim()) continue
-      try { out.push(JSON.parse(line) as ActivityRow) } catch { /* skip 坏行 */ }
-    }
-  } catch { /* 无历史 */ }
-  return out
+/**
+ * 读某会话的历史行（由 HistoryStore 提供：索引 + 解析缓存 + .jsonl.gz 透明读取）。
+ * 无文件 / 读失败 = 空数组；坏行由 store 计数（/selfcheck 的 history.badLines）。
+ */
+function loadHistoryRows(store: HistoryStore, sessionKey: string): ActivityRow[] {
+  return store.rows(sessionKey).rows
 }
 
 /**
@@ -1135,11 +1676,29 @@ export function buildAgentReport(input: {
   dupThreshold?: number
   failingThreshold?: number
   pressureThreshold?: number
+  /** failures 明细最多返回多少条（默认 20）；聚类不受它影响 */
+  maxFailures?: number
+  /** 失败聚类的最小重复次数（默认 2，下限 2）：单次失败不成簇，避免把偶发当模式 */
+  clusterMinCount?: number
+  /** 技能前后对比的窗口轮数（默认 3，下限 1）：取加载轮前后各 N 轮做指标对比 */
+  skillWindowTurns?: number
+  /**
+   * 「本运行」的判定基准，缺省 = 本进程 RUN_ID。
+   * 报告的 totals/tools/failures/verdicts 只统计这个 runId 的行，其余单列于 history ——
+   * 所以聚合别的运行（或单测里造数据）必须显式指定它，否则会被当成历史片段。
+   */
+  runId?: string
 }): AgentReport {
   const { rows, contextBudgetBytes } = input
+  const runId = input.runId ?? RUN_ID
   const dupT = input.dupThreshold ?? 3
   const failT = input.failingThreshold ?? 2
   const pressT = input.pressureThreshold ?? 0.8
+  const maxF = Math.max(1, Math.floor(input.maxFailures ?? 20))
+  const clusterMin = Math.max(2, Math.floor(input.clusterMinCount ?? 2))
+  /** 聚类本身也要封顶，否则报告会被大量单例签名撑大 */
+  const maxClusters = 20
+  const skillWindow = Math.max(1, Math.floor(input.skillWindowTurns ?? 3))
   /** 输入行先归一排序（工具路径上已由 mergeActivityRows 排好；直调方传未排序行也安全） */
   const ordered = [...rows].sort((a, b) => (a.ts - b.ts) || (a.seq - b.seq))
 
@@ -1147,8 +1706,8 @@ export function buildAgentReport(input: {
   // 本进程的行带当前 RUN_ID；历史 JSONL 里重启前的行带旧 runId 或无该字段。
   // totals/tools/failures/context/latest 只在本运行上聚合，历史片段单列于
   // report.history —— 避免把两段进程里各自 1..N 的编号/轮次当成一套连续口径（#2/#3/#5）。
-  const cur = ordered.filter((r) => r.runId === RUN_ID)
-  const hist = ordered.filter((r) => r.runId !== RUN_ID)
+  const cur = ordered.filter((r) => r.runId === runId)
+  const hist = ordered.filter((r) => r.runId !== runId)
   const crossRun = hist.length > 0
 
   // 轮次范围过滤（只作用于本运行：历史片段的 turn 编号与本轮不可比）
@@ -1166,13 +1725,19 @@ export function buildAgentReport(input: {
   const toolRowsAll = scope.filter((r) => r.kind === 'tool')
   const failed = scope.filter((r) => r.ok === false)
   const inFlight = scope.filter((r) => r.settled === false)
-  // 自我观测剔除（#4）：生成本报告的 activity_report 调用自身此刻进行中（settled:false），
-  // 从 inFlight 计数 / 工具频次 / 明细里剔除，改由 selfNote 说明，避免每次调用必有的 info 噪音。
-  const selfRows = inFlight.filter((r) => r.name === 'activity_report')
-  const inFlightOther = inFlight.filter((r) => r.name !== 'activity_report')
-  const toolRows = selfRows.length ? toolRowsAll.filter((r) => !selfRows.includes(r)) : toolRowsAll
+  // 自我观测剔除（#4）：本插件自己暴露的工具（activity_report / task_verdict / evolution_proposal）是「监控自身的记账」，
+  // 不是 agent 为任务干的活。统一从 inFlight 计数 / 工具频次 / 重复阈值 / 耗时合计里剔除，
+  // 明细 latest 里仍保留（调用过就是事实），由 selfNote 说明剔除了几次。
+  // 原实现只剔除「取数时自身 in-flight 的 activity_report」；task_verdict 落地后必须扩展 ——
+  // 否则每写一次验收结论，都会往工具频次与 durationMs 里加一笔监控自己的开销。
+  const MONITOR_TOOLS = new Set(['activity_report', 'task_verdict', 'evolution_proposal'])
+  const selfRows = scope.filter((r) => r.kind === 'tool' && MONITOR_TOOLS.has(r.name))
+  const selfRowSet = new Set(selfRows)
+  const inFlightOther = inFlight.filter((r) => !MONITOR_TOOLS.has(r.name))
+  const toolRows = toolRowsAll.filter((r) => !MONITOR_TOOLS.has(r.name))
   const selfNote = selfRows.length
-    ? `本次 activity_report 调用取数时自身仍在进行中，已从 inFlight 计数与工具频次中剔除（进行中的调用没有定稿耗时）`
+    ? `已从 inFlight 计数 / 工具频次 / 耗时合计中剔除本插件自身的工具调用 ${selfRows.length} 次`
+      + `（${[...new Set(selfRows.map((r) => r.name))].join('、')}）—— 那是监控自身的记账，不算任务活动`
     : undefined
 
   const turnsSet = new Set(scope.map((r) => r.turn).filter((t): t is number => t != null))
@@ -1181,7 +1746,7 @@ export function buildAgentReport(input: {
   // 时长双口径（#1）：
   //  durationMs = 活跃调用耗时之和（仅已定稿 llm+tool 行；进行中调用未定稿、不计入）
   //  spanMs    = 本运行首→末事件的墙钟跨度（含空闲等待，≈ 会话实际时间轴）
-  const settled = scope.filter((r) => r.settled !== false)
+  const settled = scope.filter((r) => r.settled !== false && !selfRowSet.has(r))
   const durationMs = settled.reduce((n, r) => n + (r.durationMs ?? 0), 0)
   const firstTs = scope.length ? Math.min(...scope.map((r) => r.ts)) : 0
   const lastTs = scope.length ? Math.max(...scope.map((r) => (r.durationMs ? r.ts + r.durationMs : r.ts))) : 0
@@ -1202,7 +1767,172 @@ export function buildAgentReport(input: {
     .sort((a, b) => b.count - a.count)
   const duplicated = byName.filter((e) => e.count >= dupT)
 
-  const failures = failed.map((r) => ({ seq: r.seq, ts: r.ts, kind: r.kind, name: r.name, summary: (r.summary || '').slice(0, 160) })).slice(0, 20)
+  const failures = failed.map((r) => ({ seq: r.seq, ts: r.ts, kind: r.kind, name: r.name, summary: (r.summary || '').slice(0, 160) })).slice(0, maxF)
+  const failuresTruncated = failed.length > maxF ? { total: failed.length, shown: maxF } : undefined
+
+  // ── L1 失败聚类：按签名聚合同类失败 ──
+  // 只做「同现统计」（同一签名出现几次、跨几个轮次），不推断原因 —— 因果结论不是这份数据能给的。
+  const clusterMap = new Map<string, {
+    sig: string; tool: string; errClass: string; count: number
+    turns: Set<number>; firstSeq: number; lastSeq: number; exampleSeqs: number[]; sampleSummary: string
+  }>()
+  for (const r of failed) {
+    // 历史行没有 failSig：单列 legacy 簇（用摘要归一化做键），绝不冒充真签名
+    const sig = r.failSig ?? `${r.name}|legacy|${normalizeErrorText(r.summary || '')}`
+    const [tool = r.name, errClass = 'legacy'] = sig.split('|')
+    let c = clusterMap.get(sig)
+    if (!c) {
+      c = { sig, tool, errClass, count: 0, turns: new Set<number>(), firstSeq: r.seq, lastSeq: r.seq, exampleSeqs: [], sampleSummary: (r.summary || '').slice(0, 120) }
+      clusterMap.set(sig, c)
+    }
+    c.count++
+    if (r.turn != null) c.turns.add(r.turn)
+    c.firstSeq = Math.min(c.firstSeq, r.seq)
+    c.lastSeq = Math.max(c.lastSeq, r.seq)
+    if (c.exampleSeqs.length < 3 && !c.exampleSeqs.includes(r.seq)) c.exampleSeqs.push(r.seq)
+  }
+  const failureClusters = [...clusterMap.values()]
+    .filter((c) => c.count >= clusterMin)
+    .sort((a, b) => b.count - a.count || a.firstSeq - b.firstSeq)
+    .slice(0, maxClusters)
+    .map((c) => ({
+      sig: c.sig, tool: c.tool, errClass: c.errClass, count: c.count,
+      turns: [...c.turns].sort((x, y) => x - y),
+      firstSeq: c.firstSeq, lastSeq: c.lastSeq, exampleSeqs: c.exampleSeqs, sampleSummary: c.sampleSummary,
+    }))
+
+  // ── L2 验收结论：只读 kind === 'verdict' 的行 ──
+  // 它与 failed / durationMs 完全解耦：不打 ok、不带 durationMs（见 types.ts 的取舍说明）
+  const verdicts = scope
+    .filter((r) => r.kind === 'verdict' && !!r.verdict)
+    .sort((a, b) => a.ts - b.ts)
+    .slice(-20)
+    .map((r) => ({
+      seq: r.seq,
+      ts: r.ts,
+      status: String(r.verdict!.status),
+      basis: String(r.verdict!.basis ?? '').slice(0, 500),
+      evidenceSeqs: r.verdict!.evidenceSeqs ?? [],
+    }))
+  const lastVerdict = verdicts.length ? verdicts[verdicts.length - 1] : undefined
+  // 只有在「完全没有验收结论」时才给过程推断，并且自带「这不是结论」的说明
+  let likelyOutcome: AgentReport['likelyOutcome']
+  if (!lastVerdict && scope.length > 0) {
+    const reasons: string[] = []
+    reasons.push(failed.length > 0 ? `${failed.length} 条调用失败` : '未见失败调用')
+    if (inFlightOther.length > 0) reasons.push(`${inFlightOther.length} 条调用仍在进行中`)
+    reasons.push('本次范围内没有任何验收结论（verdict），以下只是过程推断')
+    likelyOutcome = {
+      label: failed.length === 0 && inFlightOther.length === 0 ? 'likely-pass' : 'likely-fail',
+      confidence: 'low',
+      reasons,
+    }
+  }
+
+  // ── L6 进化提案（只报数，不执行） ──
+  const proposalRows = scope.filter((r) => r.kind === 'proposal' && !!r.proposal)
+  const proposals = proposalRows.slice(-20).map((r) => {
+    const p = r.proposal as NonNullable<typeof r.proposal>
+    return {
+      seq: r.seq,
+      ts: r.ts,
+      pkind: String(p.pkind),
+      action: String(p.action),
+      target: String(p.target ?? ''),
+      rationale: String(p.rationale ?? ''),
+      status: String(p.status),
+      by: String(p.by),
+      evidenceSeqs: Array.isArray(p.evidenceSeqs) ? p.evidenceSeqs : [],
+    }
+  })
+  const pendingProposals = proposalRows.filter((r) => String(r.proposal?.status) === 'proposed').length
+
+  // ── L3 工具级「同现」统计（只用已有数据，不新增采集） ──
+  const maxTurnOfSession = new Map<string, number>()
+  for (const r of scope) {
+    if (r.turn == null) continue
+    const sid = r.sessionId ?? ''
+    maxTurnOfSession.set(sid, Math.max(maxTurnOfSession.get(sid) ?? 0, r.turn))
+  }
+  /** 每个轮次里出现过哪些验收结论状态（同一轮可能有多条 verdict） */
+  const verdictStatusByTurn = new Map<string, Set<string>>()
+  for (const r of scope) {
+    if (r.kind !== 'verdict' || r.turn == null || !r.verdict) continue
+    const k = `${r.sessionId ?? ''}|${r.turn}`
+    const set = verdictStatusByTurn.get(k) ?? new Set<string>()
+    set.add(String(r.verdict.status))
+    verdictStatusByTurn.set(k, set)
+  }
+  const outcomeByName = new Map<string, {
+    calls: number; failed: number; inFinalTurn: number; retriedInTurn: number
+    inTurnWithVerdictPass: number; inTurnWithVerdictFail: number
+  }>()
+  const seenPerTurn = new Map<string, number>()
+  for (const t of toolRows) {
+    let e = outcomeByName.get(t.name)
+    if (!e) {
+      e = { calls: 0, failed: 0, inFinalTurn: 0, retriedInTurn: 0, inTurnWithVerdictPass: 0, inTurnWithVerdictFail: 0 }
+      outcomeByName.set(t.name, e)
+    }
+    e.calls++
+    if (t.ok === false) e.failed++
+    if (t.turn != null) {
+      const sid = t.sessionId ?? ''
+      if (t.turn === maxTurnOfSession.get(sid)) e.inFinalTurn++
+      const st = verdictStatusByTurn.get(`${sid}|${t.turn}`)
+      if (st?.has('pass')) e.inTurnWithVerdictPass++
+      if (st?.has('fail')) e.inTurnWithVerdictFail++
+      // 同轮重复：第 2 次起累加（次数 - 1 的和）
+      const tk = `${sid}|${t.turn}|${t.name}`
+      const n = (seenPerTurn.get(tk) ?? 0) + 1
+      seenPerTurn.set(tk, n)
+      if (n > 1) e.retriedInTurn++
+    }
+  }
+  const toolOutcome = [...outcomeByName.entries()]
+    .map(([name, e]) => ({ name, ...e }))
+    .sort((a, b) => b.calls - a.calls || a.name.localeCompare(b.name))
+
+  // ── L4 技能加载前后窗口对比 ──
+  const skillLoads = scope
+    .filter((r) => r.tag === 'skill')
+    .map((r) => ({
+      name: (r.summary || '').replace(/^skill:\s*/, '').trim() || '(未命名)',
+      seq: r.seq,
+      ts: r.ts,
+      turn: r.turn ?? 0,
+    }))
+  /** 给定轮次集合的指标；窗口内一行都没有 → 缺省（不填 0） */
+  const metricOfTurns = (turns: number[]): { turns: number; toolCalls: number; failedCalls: number; inputTokens: number } | undefined => {
+    const set = new Set(turns)
+    const rowsIn = scope.filter((r) => r.turn != null && set.has(r.turn))
+    if (rowsIn.length === 0) return undefined
+    const inLlm = rowsIn.filter((r) => r.kind === 'llm')
+    return {
+      turns: new Set(rowsIn.map((r) => r.turn)).size,
+      toolCalls: rowsIn.filter((r) => r.kind === 'tool').length,
+      failedCalls: rowsIn.filter((r) => r.ok === false).length,
+      inputTokens: inLlm.reduce((n, r) => n + (r.usageIn ?? 0), 0),
+    }
+  }
+  const skillEffect: AgentReport['skillEffect'] = []
+  const skillSeen = new Set<string>()
+  for (const load of skillLoads) {
+    if (skillSeen.has(load.name)) continue
+    skillSeen.add(load.name)
+    // 锚点 = 该技能首次加载所在轮次；同技能多次加载只做一次对比，次数记在 loads
+    const anchor = load.turn
+    const beforeTurns = anchor > 1
+      ? [...Array(skillWindow).keys()].map((i) => anchor - skillWindow + i).filter((t) => t >= 1)
+      : []
+    const afterTurns = anchor >= 1 ? [...Array(skillWindow).keys()].map((i) => anchor + 1 + i) : []
+    skillEffect.push({
+      name: load.name,
+      loads: skillLoads.filter((l) => l.name === load.name).length,
+      windowBefore: beforeTurns.length ? metricOfTurns(beforeTurns) : undefined,
+      windowAfter: afterTurns.length ? metricOfTurns(afterTurns) : undefined,
+    })
+  }
 
   // 上下文压力 = 本运行内最后一个带 contextBytes 的 llm 行（按 ts 最大）
   const ctxRows = llm.filter((r) => r.contextBytes != null)
@@ -1236,6 +1966,16 @@ export function buildAgentReport(input: {
   if (failed.length > 0) signals.push({ severity: 'warn', text: `本运行范围内 ${failed.length} 条调用处于失败状态（详见 failures）` })
   if (inFlightOther.length > 0) signals.push({ severity: 'info', text: `当前有 ${inFlightOther.length} 条调用进行中（尚未定稿，durationMs 暂不含它们）` })
   if (crossRun) signals.push({ severity: 'info', text: `数据跨 ${1 + new Set(hist.map((r) => r.runId ?? '(unknown)')).size} 个进程运行（重启前后），totals 只统计本运行；历史片段见 history 字段` })
+  // 失败聚类信号：只陈述「同一签名重复了几次、跨几个轮次」，不写因果
+  for (const c of failureClusters.slice(0, 3)) {
+    signals.push({ severity: 'warn', text: `同一失败签名重复 ${c.count} 次（工具 ${c.tool} · ${c.turns.length} 个轮次）：${c.sig} —— 同类错误反复出现，先确认是不是同一个原因再重试` })
+  }
+  if (failureClusters.length > 3) signals.push({ severity: 'warn', text: `另有 ${failureClusters.length - 3} 个失败签名簇（见 failureClusters 字段）` })
+  if (failuresTruncated) signals.push({ severity: 'info', text: `failures 明细只列了前 ${failuresTruncated.shown} 条（共 ${failuresTruncated.total} 条）；failureClusters 覆盖全部失败` })
+  if (lastVerdict && lastVerdict.status !== 'pass' && lastVerdict.status !== 'unknown') {
+    signals.push({ severity: 'warn', text: `最近一次验收结论为 ${lastVerdict.status}：${lastVerdict.basis}` })
+  }
+  if (likelyOutcome) signals.push({ severity: 'info', text: `过程推断（非验收结论，置信度 low）：${likelyOutcome.label} —— ${likelyOutcome.reasons.join('；')}` })
 
   // 历史运行单列（#5）：按 runId 分组（旧版无 runId 的行归 '(unknown)'），只给计数与时间轴，不并入 totals
   let history: AgentReport['history']
@@ -1266,11 +2006,22 @@ export function buildAgentReport(input: {
     sessionId: input.sessionId,
     generatedAt: Date.now(),
     scope: scopeLabel,
-    runId: RUN_ID,
+    // 与上面切分用的基准一致：指定 runId 时报告自称的就是那个运行，不能写死本进程 id
+    runId,
     crossRun,
     totals: { llmCalls: llm.length, toolCalls: toolRows.length, failedCalls: failed.length, turns: turnsSet.size, inFlight: inFlightOther.length, inputTokens, outputTokens, durationMs, spanMs },
     tools: { byName, duplicated },
     failures,
+    failuresTruncated,
+    failureClusters,
+    verdicts,
+    lastVerdict,
+    likelyOutcome,
+    toolOutcome,
+    skillLoads,
+    skillEffect,
+    proposals,
+    pendingProposals,
     context,
     inFlight: inFlightOther.map((r) => ({ seq: r.seq, ts: r.ts, kind: r.kind, name: r.name, summary: (r.summary || '').slice(0, 120), startedAt: r.ts })),
     signals,

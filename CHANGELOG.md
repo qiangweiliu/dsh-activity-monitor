@@ -1,0 +1,53 @@
+# Changelog
+
+本插件遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)；协议版本见 `src/wire.ts` 的 `PROTOCOL`
+（轻行/按需正文的分层契约，变更时递增）。
+
+## [0.4.0] - 2026-10-01
+
+### 新增（agent 自我进化的数据面与动作面）
+
+- **L3 工具级「同现」统计** `toolOutcome`：某工具出现在哪类轮次里 —— 收敛轮（该会话本范围内末轮）、
+  同轮重试、带 `pass` / `fail` 验收结论的轮次。**是同现统计不是因果推断**（无对照组）。
+- **L4 技能加载前后窗口** `skillLoads` / `skillEffect`：以技能首次加载轮次为锚点，对比前后各
+  `skillWindowTurns`（默认 3）轮的轮数 / 工具数 / 失败数 / 输入 token。**是前后对比不是 A/B**；
+  窗口内无行时缺省而非填 0。
+- **L6 进化提案** `evolution_proposal` 工具 + `kind:'proposal'` 行 + 报告 `proposals` /
+  `pendingProposals`：把「该学什么 / 该装什么 / 该停用什么」写成可审阅的提案，必须指回证据
+  （`evidenceSeqs`）。**本插件只写提案、不执行任何变更**：状态固定 `proposed`，批准与执行由人
+  通过既有执行器（`dshmarket` / `@michengai/dsh-skills-manager`）完成。
+- 自我观测剔除扩展到三个自身工具（`activity_report` / `task_verdict` / `evolution_proposal`）。
+- `docs/agent-evolution-data.md`：新增 §10（提案层设计）与 §11（dsh 运行时变更边界实测）。
+
+## [0.3.0] - 2026-10-01
+
+### 新增（结果数据与失败归因）
+
+- **L1 失败签名聚类**：`failSig` = `工具名|错误类别|归一化错误首行`（去 ANSI、路径→`<path>`、
+  数字→`<n>`、120 字截断），在 `tools/execute` 钩子内当场计算；报告给出 `failureClusters` /
+  `failuresTruncated`，`failures` 原样保留（只加不删）。
+- **L2 验收结论**：`task_verdict` 工具 + `kind:'verdict'` 行；`verdict` 行不打 `ok`、不带
+  `durationMs`（否则污染 `failedCalls` 与耗时合计）；没有 verdict 时才给 `likelyOutcome`
+  （置信度固定 `low`，显式声明「非验收结论」）。
+- `package.json` 的 `files` 补齐 `lib/*.js` 与 `*.d.ts`；移除死依赖 `@deepseek-ai/dsh-client-runtime`
+  （修掉 `npm install` 的 ERESOLVE）。
+
+### 修复
+
+- `/row` 命中计数口径：hits = 真的取回正文，misses = 真的 404。
+- 客户端 `openSession` 未 await（把异步失败当成功返回）。
+
+## [0.2.0] - 2026-09-30
+
+### 新增（分层协议与历史库）
+
+- 协议 v2：快照只发轻行（标量 + `hasBody`），正文按需 `/row` 拉取；实测单行 346 B（轻行）
+  vs 265,350 B（正文）。
+- marks 增量日志（带 gen 游标），轮询为真增量（约 149 B/次）。
+- `HistoryStore`：按会话 JSONL 落盘 + `index.json` 索引 + 超 30 天 gzip 归档（读取透明）。
+- 配置面 `resolveConfig`（`maxRows` / 预算 / 轮询 / 保留）；`/selfcheck` 自检端点。
+
+## [0.1.0] - 2026-09-29
+
+- 首个可用版本：`llm/stream` 与 `tools/execute` 两个钩子、活动行模型、轮次分组面板、
+  按需展开正文、`activity_report` 工具。
