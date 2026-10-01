@@ -3,12 +3,12 @@ dsh运行状态监控插件
 
 ## agent 侧工具（自我进化的结果数据）
 
-本插件在 `tools` 服务就绪时懒注册两个工具（没有 tools 服务的部署里监控核心照常跑，只是不暴露工具）：
+本插件在 `tools` 服务就绪时懒注册三个工具（没有 tools 服务的部署里监控核心照常跑，只是不暴露工具）：
 
 - `activity_report` —— **读**：调用量 / token / 耗时、工具频次与失败、**失败聚类**（同一失败签名重复几次）、
   **任务验收结论**、上下文压力、一组陈述性 signals。
   参数：`sessionId` / `recentTurns` / `maxFailures`（默认 20）/ `clusterMinCount`（默认 2）/
-  `skillWindowTurns`（默认 3）。
+  `skillWindowTurns`（默认 3）/ `crossSessions`（跨会话聚合，缺省不聚合）。
 - `task_verdict` —— **写**：记录一次任务或子任务的验收结论（`pass|fail|partial|unknown`）与依据，
   可选 `evidenceSeqs` / `verifyCommand` / `verifySeqs` 引用**真实工具行**当证据。
   **本插件不执行任何验收命令**：验收命令请用普通工具（如 `bash`）跑，再用 seq 做关联 ——
@@ -27,13 +27,21 @@ dsh运行状态监控插件
   签名在 `tools/execute` 钩子内当场算 —— 只有那里拿得到结构化错误（`result.isError` / `error.message`）；
   事后从 `detail` 那段「参数 + 结果」散文里反解会脆。
 - 报告字段：`failureClusters`、`failuresTruncated`、`verdicts`、`lastVerdict`、`likelyOutcome`、
-  `toolOutcome`、`skillLoads`、`skillEffect`、`proposals`、`pendingProposals`。`failures` 原样保留。
+  `toolOutcome`、`skillLoads`、`skillEffect`、`proposals`、`pendingProposals`、`crossSessions`（只在传参时出现）。
+  `failures` 原样保留。
 
 - 工具级「同现」统计（`toolOutcome`）：该工具出现在**哪类轮次**里 —— 收敛轮（该会话本范围内末轮）、
   同轮重试、带 `pass` / `fail` 验收结论的轮次。**是同现统计不是因果推断**（没有对照组）：
   只能说「它出现在通过验收的轮次 N 次」，不能说「它带来成功」。
 - 技能加载前后窗口（`skillLoads` / `skillEffect`）：以该技能**首次加载**所在轮次为锚点，
   对比前后各 `skillWindowTurns`（默认 3）轮的轮数 / 工具数 / 失败数 / 输入 token。
+- 跨会话聚合（`crossSessions`）：统计**最近 N 个会话**（默认取配置 `crossSessionLimit`＝12，上限 50）的
+  行数 / 轮数 / 工具数 / 失败数 / token / 首要失败签名，并给出**跨会话复现的失败签名**
+  （同一签名出现在 ≥2 个会话里）—— 这是「在哪类任务上反复低效」的直接输入。
+  三条口径：①只取最近 N 个（全库聚合对「最近反复低效」没有增益，却要付全部 IO）；
+  ②`recurring` 是**同现统计**，不等于因果，也不代表任务难度相同；
+  ③汇总有 `summaries.json` 缓存（键 = 文件行数 + 末次时间），它是**可重建的加速层**：
+  删掉只影响速度、不影响任何事实；**正在跑的会话不吃缓存**（它还有没落盘的行，用缓存会给出滞后汇总）。
   **是前后对比不是 A/B**（窗口内任务难度不同），只能当「值得进一步验证」的线索；
   窗口内没有行时该项**缺省而非填 0**（否则看起来像那段时间没有任何活动）。
 - 两个**刻意的取舍**（改之前先读文档）：`verdict` 行不打 `ok`、不带 `durationMs` ——

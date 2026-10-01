@@ -28,10 +28,12 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-tools'
 import { resolveConfig, type AMConfig } from './config.js'
 import { HistoryStore, type SessionInfo } from './history.js'
-import { MarkLog, PROTOCOL, applyMarks, computeMarks, toLight, turnKey, type LightRow, type MarkEntry } from './wire.js'
+import { MarkLog, PROTOCOL, applyMarks, computeMarks, mergeActivityRows, toLight, turnKey, type LightRow, type MarkEntry } from './wire.js'
 import type { ActivityRow, ActivitySection } from './types.js'
 import { failureSig, normalizeErrorText } from './sig.js'
 import { effectiveProposalStatus } from './derive.js'
+import { join } from 'node:path'
+import { SummaryCache, collectCrossSessions, type CrossSessions } from './cross.js'
 
 // 对外 API 不变：类型仍然可从本模块取（index.js 同时是宿主半身的入口与 .d.ts 的出口）
 export type { ActivityRow, ActivitySection } from './types.js'
@@ -97,6 +99,12 @@ export function apply(ctx: Context, rawConfig?: unknown) {
   })
   // 卸载兜底：待写缓冲里可能还有几百 KB 没落盘，close() 会同步刷出去
   ctx.effect(() => () => { store.close() }, 'activity-monitor: history store')
+  /**
+   * L5 跨会话汇总缓存（summaries.json，与历史同目录）。
+   * 缓存键 = (行数, lastTs)：文件没长就直接复用 —— 否则每次 activity_report(crossSessions) 都要
+   * 把全库 JSONL 读一遍。缓存坏了/缺了只当「没有缓存」重建，绝不影响报告本身（见 cross.ts 文件头）。
+   */
+  const summaryCache = new SummaryCache(join(cfg.history.dir, 'summaries.json'))
   const self: SelfState = { startedAt: Date.now(), requests: 0, badRequests: 0, endpointErrors: 0, rowBodyHits: 0, rowBodyMisses: 0 }
   function noteError(e: unknown): void {
     self.endpointErrors++
@@ -829,6 +837,7 @@ export function apply(ctx: Context, rawConfig?: unknown) {
             sessions: sessions.slice(0, 20),
             ...store.stats(),
           },
+          summaries: summaryCache.stats(),
           endpoint: {
             requests: self.requests,
             badRequests: self.badRequests,
@@ -938,6 +947,11 @@ export function apply(ctx: Context, rawConfig?: unknown) {
             type: 'number',
             description: '技能前后对比的窗口轮数（默认 3）：取该技能首次加载轮次的前后各 N 轮做指标对比。',
           },
+          crossSessions: {
+            type: 'number',
+            description: '跨会话聚合（L5）：统计最近 N 个会话的汇总与「跨会话复现的失败签名」'
+              + `（缺省不聚合；不传时的默认值取配置 crossSessionLimit=${cfg.crossSessionLimit}，上限 50）。`,
+          },
         },
         output: {
           schema: {
@@ -1007,6 +1021,26 @@ export function apply(ctx: Context, rawConfig?: unknown) {
                 lines.push(`  #${p.seq} ${p.pkind}/${p.action} ${p.target} · ${p.effectiveStatus}${changed}${ev}${p.id ? ` · id ${p.id}` : ''}`)
               }
             }
+            if (r.crossSessions) {
+              const cs = r.crossSessions
+              lines.push(`跨会话汇总（最近 ${cs.scanned.sessions} 个会话，上限 ${cs.limit}；`
+                + `本次读盘 ${cs.scanned.read} · 复用缓存 ${cs.scanned.reused}）：`)
+              for (const s of cs.sessions.slice(0, 10)) {
+                const top = s.topFailSig ? ` · 首要失败 ${s.topFailSig.count}× ${s.topFailSig.sig}` : ''
+                lines.push(`  ${s.sessionId ?? '(global)'}：${s.rows} 行 · 轮 ${s.turns} · `
+                  + `模型 ${s.llmCalls} / 工具 ${s.toolCalls} · 失败 ${s.failedCalls} · `
+                  + `in ${s.inputTokens} / out ${s.outputTokens}${top}`)
+              }
+              if (cs.recurring.length) {
+                lines.push('跨会话复现的失败签名（同现统计，不是因果）：')
+                for (const x of cs.recurring.slice(0, 8)) {
+                  lines.push(`  ${x.sessions} 个会话 / ${x.failures} 次 · ${x.sig}`)
+                }
+              } else {
+                lines.push(`没有跨会话复现的失败签名（阈值：≥${cs.minSessions} 个会话）`)
+              }
+              if (cs.scanned.badLines > 0) lines.push(`跨会话读取坏行：${cs.scanned.badLines}`)
+            }
             if (r.context.lastContextBytes != null) {
               lines.push(`上下文：${r.context.note}`)
             }
@@ -1027,7 +1061,7 @@ export function apply(ctx: Context, rawConfig?: unknown) {
           },
         },
         async execute(args: any, exec: any) {
-          const a = (args ?? {}) as { sessionId?: unknown; recentTurns?: unknown; maxFailures?: unknown; clusterMinCount?: unknown; skillWindowTurns?: unknown }
+          const a = (args ?? {}) as { sessionId?: unknown; recentTurns?: unknown; maxFailures?: unknown; clusterMinCount?: unknown; skillWindowTurns?: unknown; crossSessions?: unknown }
           const agentSid = exec?.agent?.session?.id != null ? String(exec.agent.session.id) : undefined
           const explicit = typeof a.sessionId === 'string' && a.sessionId ? a.sessionId : undefined
           let rowsAll: ActivityRow[]
@@ -1039,6 +1073,17 @@ export function apply(ctx: Context, rawConfig?: unknown) {
           } else {
             rowsAll = rows // 无会话：统计全量内存缓冲
           }
+          // L5 跨会话聚合：只在显式传参时做（默认不聚合 —— 全库扫描不该混进每次取数）
+          const crossWant = typeof a.crossSessions === 'number' && Number.isFinite(a.crossSessions) && a.crossSessions > 0
+            ? Math.floor(a.crossSessions)
+            : undefined
+          const cross = crossWant != null
+            ? collectCrossSessions(store, summaryCache, {
+              limit: Math.min(crossWant, 50),
+              // 带上内存行：落盘是异步的，不带的话当前会话的汇总会滞后（未 flush 的行看不到）
+              liveRows: rows,
+            })
+            : undefined
           return {
             // 报告对象是可 JSON 化的普通数据（运行时满足 JsonValue）；AgentReport 接口
             // 因 readonly + 缺索引签名无法被 TS 直接证明，故断言。
@@ -1046,6 +1091,7 @@ export function apply(ctx: Context, rawConfig?: unknown) {
               rows: rowsAll,
               sessionId: explicit ?? agentSid ?? null,
               contextBudgetBytes: CONTEXT_BUDGET_BYTES,
+              cross,
               recentTurns: typeof a.recentTurns === 'number' && a.recentTurns > 0 ? Math.floor(a.recentTurns) : undefined,
               maxFailures: typeof a.maxFailures === 'number' && a.maxFailures > 0 ? Math.floor(a.maxFailures) : undefined,
               clusterMinCount: typeof a.clusterMinCount === 'number' && a.clusterMinCount > 0 ? Math.floor(a.clusterMinCount) : undefined,
@@ -1707,6 +1753,11 @@ export interface AgentReport {
   }[]
   /** 待人工批准（**有效状态** === 'proposed'）的提案数 —— 只报数，不自动执行 */
   readonly pendingProposals: number
+  /**
+   * L5 跨会话聚合（只在 `crossSessions` 参数下出现）：最近 N 个会话的汇总 + 跨会话复现的失败签名。
+   * 缺省字段不存在 —— 没请求就不说，避免报告里出现一堆无关的空壳。
+   */
+  readonly crossSessions?: CrossSessions
   readonly context: {
     lastTurn?: number
     lastContextBytes?: number
@@ -1730,15 +1781,6 @@ export interface AgentReport {
   }
   /** 本运行范围内最近若干条行（按时间倒序），供 agent 看明细 */
   readonly latest: { seq: number; ts: number; kind: string; name: string; tag: string; summary: string; ok?: boolean; turn?: number }[]
-}
-
-/** 合并内存行 + 历史行（按 seq:ts 去重，内存优先——内存是更新版本） */
-function mergeActivityRows(mem: ActivityRow[], hist: ActivityRow[]): ActivityRow[] {
-  const key = (r: ActivityRow) => `${r.seq}:${r.ts}`
-  const m = new Map<string, ActivityRow>()
-  for (const r of hist) m.set(key(r), r)
-  for (const r of mem) m.set(key(r), r)
-  return [...m.values()].sort((a, b) => (a.ts - b.ts) || (a.seq - b.seq))
 }
 
 /**
@@ -1823,6 +1865,11 @@ export function buildAgentReport(input: {
    * 所以聚合别的运行（或单测里造数据）必须显式指定它，否则会被当成历史片段。
    */
   runId?: string
+  /**
+   * L5 跨会话聚合结果（由宿主侧 `cross.collectCrossSessions` 算好传入 —— 本函数保持纯函数，
+   * 不做任何 IO）。缺省 = 本次没有请求跨会话聚合，报告里就不出现 `crossSessions` 字段。
+   */
+  cross?: CrossSessions
 }): AgentReport {
   const { rows, contextBudgetBytes } = input
   const runId = input.runId ?? RUN_ID
@@ -2162,6 +2209,7 @@ export function buildAgentReport(input: {
     toolOutcome,
     skillLoads,
     skillEffect,
+    crossSessions: input.cross,
     proposals,
     pendingProposals,
     context,

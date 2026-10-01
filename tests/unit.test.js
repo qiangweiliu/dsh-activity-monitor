@@ -11,13 +11,17 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gzipSync } from 'node:zlib'
 
-import { contextDiff, effectiveProposalStatus, fmtBytes, rowsToJson, rowsToMarkdown, sessionTotals, turnSignals } from '../lib/derive.js'
+import {
+  contextDiff, effectiveProposalStatus, fmtBytes, recurringFailSigs, rowsToJson, rowsToMarkdown,
+  sessionTotals, summarizeSession, turnSignals,
+} from '../lib/derive.js'
 import { MarkLog, applyMarks, computeMarks, toLight, turnKey } from '../lib/wire.js'
 import { failureSig, normalizeErrorText } from '../lib/sig.js'
 // 宿主半身入口：index.ts 顶层只有 type-only 依赖（会被擦除），所以单测里可以直接引 lib/index.js
 import { buildAgentReport, parseProposalTransition } from '../lib/index.js'
 import { defaultConfig, resolveConfig } from '../lib/config.js'
 import { HistoryStore, parseJsonl, safeSessionKey } from '../lib/history.js'
+import { SummaryCache, SUMMARIES_VERSION, collectCrossSessions } from '../lib/cross.js'
 
 // ── 造数据的小工具 ──
 const llm = (over = {}) => ({
@@ -527,4 +531,148 @@ test('报告：状态变更行让 pendingProposals 归零，但不污染其余�
   assert.equal(after.totals.failedCalls, before.totals.failedCalls, '状态变更不改变失败计数')
   assert.equal(after.totals.durationMs, before.totals.durationMs, '状态变更不带 durationMs（跨 kind 求和会虚高）')
   assert.equal(after.toolOutcome.find((e) => e.name === 'evolution_proposal'), undefined, '提案/变更行不进工具 ROI')
+})
+// ── L5 跨会话聚合：纯函数 / 磁盘缓存 / 聚合器 ──
+test('summarizeSession 复用 sessionTotals 的口径，并按失败签名聚合', () => {
+  const rows = [
+    llm({ seq: 1, ts: 100, turn: 1, usageIn: 10, usageOut: 2 }),
+    tool({ seq: 2, ts: 200, turn: 1, ok: false, failSig: 'bash|error|enoent' }),
+    tool({ seq: 3, ts: 300, turn: 1, ok: false, failSig: 'bash|error|enoent' }),
+    tool({ seq: 4, ts: 400, turn: 2, ok: true }),
+    tool({ seq: 5, ts: 500, turn: 2, ok: false, failSig: 'read|error|eacces' }),
+  ]
+  const s = summarizeSession(rows, 's1')
+  assert.equal(s.sessionId, 's1')
+  assert.equal(s.rows, 5)
+  assert.equal(s.firstTs, 100)
+  assert.equal(s.lastTs, 500)
+  assert.equal(s.turns, 2, '轮数与 sessionTotals 同口径')
+  assert.equal(s.llmCalls, 1)
+  assert.equal(s.toolCalls, 4)
+  assert.equal(s.failedCalls, 3)
+  assert.equal(s.inputTokens, 10)
+  assert.equal(s.outputTokens, 2)
+  assert.deepEqual(s.failSigs, [
+    { sig: 'bash|error|enoent', count: 2 },
+    { sig: 'read|error|eacces', count: 1 },
+  ])
+  assert.deepEqual(s.topFailSig, { sig: 'bash|error|enoent', count: 2 })
+  assert.equal(s.topTools[0].name, 'bash')
+  const empty = summarizeSession([], 'x')
+  assert.equal(empty.topFailSig, null, '没有失败就不编一个签名出来')
+  assert.equal(empty.turns, 0)
+})
+
+test('recurringFailSigs 只认跨会话复现：同一会话里重复多少次都只算一个会话', () => {
+  const A = summarizeSession([
+    tool({ seq: 1, ts: 1, ok: false, failSig: 'sig-1' }),
+    tool({ seq: 2, ts: 2, ok: false, failSig: 'sig-1' }),
+  ], 'A')
+  const B = summarizeSession([
+    tool({ seq: 3, ts: 3, ok: false, failSig: 'sig-2' }),
+    tool({ seq: 4, ts: 4, ok: false, failSig: 'sig-2' }),
+    tool({ seq: 5, ts: 5, ok: false, failSig: 'sig-1' }),
+  ], 'B')
+  const C = summarizeSession([tool({ seq: 6, ts: 6, ok: false, failSig: 'sig-3' })], 'C')
+  const rec = recurringFailSigs([A, B, C], 2)
+  assert.deepEqual(rec.map((x) => x.sig), ['sig-1'], 'sig-2 只在一个会话里炸过 → 不算跨会话复现')
+  assert.equal(rec[0].sessions, 2)
+  assert.equal(rec[0].failures, 3, 'A 两次 + B 一次 = 3 次')
+  assert.deepEqual(recurringFailSigs([A, B, C], 1).map((x) => x.sig), ['sig-1', 'sig-2', 'sig-3'])
+})
+
+test('SummaryCache：键是 (行数, lastTs)，坏文件/旧版本当空缓存，写得进读得回', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'am-cache-'))
+  try {
+    const file = join(dir, 'summaries.json')
+    const sum = summarizeSession([tool({ seq: 1, ts: 1, ok: false, failSig: 'sig-x' })], 'A')
+    const c1 = new SummaryCache(file)
+    c1.load()
+    assert.equal(c1.get('A', 3, 100), undefined, '空缓存一定 miss')
+    c1.set('A', sum, 3, 100)
+    assert.equal(c1.save(), true)
+    assert.equal(c1.get('A', 3, 100).sessionId, 'A', '同键命中')
+    assert.equal(c1.get('A', 4, 100), undefined, '行数变了 → 失效')
+    assert.equal(c1.get('A', 3, 101), undefined, '末次时间变了 → 失效')
+    assert.equal(c1.get('B', 3, 100), undefined, '没见过的会话 → 失效')
+    assert.equal(c1.save(), false, '没有变更就不写盘')
+
+    const c2 = new SummaryCache(file)
+    c2.load()
+    assert.equal(c2.get('A', 3, 100).rows, 1, '重启后也能读回 —— 省下的就是那次全库扫描')
+
+    writeFileSync(file, '{ 这不是 JSON')
+    const c3 = new SummaryCache(file)
+    c3.load()
+    assert.equal(c3.get('A', 3, 100), undefined, '坏文件 = 空缓存，不能抛')
+
+    writeFileSync(file, JSON.stringify({ v: SUMMARIES_VERSION + 1, entries: { A: { rows: 3, lastTs: 100, sum } } }))
+    const c4 = new SummaryCache(file)
+    c4.load()
+    assert.equal(c4.get('A', 3, 100), undefined, '版本不符 → 重建')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('collectCrossSessions：只读最近 limit 个会话；行数未变时全部命中缓存', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'am-cross-'))
+  try {
+    const store = new HistoryStore({ dir })
+    store.append(tool({ seq: 1, ts: 100, sessionId: 'CS1', runId: 'old', ok: false, failSig: 'bash|error|enoent' }))
+    store.append(tool({ seq: 2, ts: 200, sessionId: 'CS2', runId: 'old', ok: false, failSig: 'bash|error|enoent' }))
+    store.append(tool({ seq: 3, ts: 300, sessionId: 'CS3', runId: 'old', ok: false, failSig: 'read|error|eacces' }))
+    store.flushSync()
+    const cache = new SummaryCache(join(dir, 'summaries.json'))
+
+    const r1 = collectCrossSessions(store, cache, { limit: 10 })
+    assert.equal(r1.scanned.sessions, 3)
+    assert.equal(r1.scanned.read, 3, '首次必须读盘')
+    assert.equal(r1.scanned.reused, 0)
+    assert.equal(r1.recurring.length, 1, '只有 enoent 跨了两个会话')
+    assert.match(r1.recurring[0].sig, /enoent/)
+    assert.equal(r1.recurring[0].sessions, 2)
+    assert.equal(r1.sessions.reduce((n, s) => n + s.rows, 0), 3)
+
+    const r2 = collectCrossSessions(store, cache, { limit: 10 })
+    assert.equal(r2.scanned.read, 0, '行数/末次时间都没变 → 一次盘都不读')
+    assert.equal(r2.scanned.reused, 3)
+    assert.equal(r2.cache.hits >= 3, true, `缓存命中计数可见（实 ${r2.cache.hits}）`)
+
+    const r3 = collectCrossSessions(store, cache, { limit: 2 })
+    assert.equal(r3.scanned.sessions, 2, 'limit 生效（只取最近的 N 个）')
+
+    store.append(tool({ seq: 4, ts: 400, sessionId: 'CS1', runId: 'old', ok: true }))
+    store.flushSync()
+    const r4 = collectCrossSessions(store, cache, { limit: 10 })
+    assert.equal(r4.scanned.read, 1, '只有被追加过的那一个会话重读')
+    assert.equal(r4.scanned.reused, 2)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+test('collectCrossSessions：带内存行时当前会话不吃缓存的滞后值（未落盘的行也算进去）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'am-live-'))
+  try {
+    const store = new HistoryStore({ dir })
+    store.append(tool({ seq: 1, ts: 100, sessionId: 'LV1', runId: 'old', ok: true }))
+    store.flushSync()
+    const cache = new SummaryCache(join(dir, 'summaries.json'))
+    const live = [tool({ seq: 2, ts: 200, sessionId: 'LV1', runId: 'r1', ok: false, failSig: 'sig-live' })]
+
+    const r = collectCrossSessions(store, cache, { limit: 10, liveRows: live })
+    assert.equal(r.scanned.live, 1, '有内存行的会话走内存路径')
+    assert.equal(r.scanned.read, 0, '走内存 → 既不吃缓存也不重读文件')
+    const s = r.sessions.find((x) => x.sessionId === 'LV1')
+    assert.equal(s.rows, 2, '磁盘 1 行 + 内存 1 行 = 2 行（按 seq:ts 合并）')
+    assert.equal(s.failedCalls, 1, '未落盘的失败也在内 —— 这就是修掉的滞后')
+    assert.equal(s.topFailSig.sig, 'sig-live')
+
+    // 不带内存行时回到磁盘口径（另一种用法，不能被内存行污染）
+    const r2 = collectCrossSessions(store, cache, { limit: 10 })
+    assert.equal(r2.sessions.find((x) => x.sessionId === 'LV1').rows, 1)
+    assert.equal(r2.scanned.live, 0)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

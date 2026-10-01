@@ -43,6 +43,11 @@ export interface AMConfig {
   }
   /** marks 日志的容量（超过后最旧的标记被丢弃，客户端会用 tooOld 触发整段重载） */
   markLogCap: number
+  /**
+   * 跨会话聚合（L5）默认统计多少个会话；`activity_report` 的 `crossSessions` 参数可覆盖（上限 50）。
+   * 只取最近 N 个会话：全库聚合对「最近在哪类任务上反复低效」没有增益，却要付全部 IO。
+   */
+  crossSessionLimit: number
   /** 是否注册 HTTP 端点（关掉 = 只采集不暴露） */
   endpoints: boolean
   /** 配置里被忽略/被修正的项（失败软着陆的可观测出口） */
@@ -72,6 +77,7 @@ export function defaultConfig(env: NodeJS.ProcessEnv = process.env, home?: strin
       backfillRows: 500,
     },
     markLogCap: 2000,
+    crossSessionLimit: 12,
     endpoints: true,
     issues: [],
   }
@@ -147,6 +153,7 @@ export function resolveConfig(raw: unknown, env: NodeJS.ProcessEnv = process.env
       backfillRows: asInt(client.backfillRows, base.client.backfillRows, 10, 20_000, 'client.backfillRows', issues),
     },
     markLogCap: asInt(src.markLogCap, base.markLogCap, 100, 200_000, 'markLogCap', issues),
+    crossSessionLimit: asInt(src.crossSessionLimit, base.crossSessionLimit, 1, 50, 'crossSessionLimit', issues),
     endpoints: asBool(src.endpoints, base.endpoints, 'endpoints', issues),
     issues,
   }

@@ -25,6 +25,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis';
 import type { ActivityRow } from './types.js';
+import { type CrossSessions } from './cross.js';
 export type { ActivityRow, ActivitySection } from './types.js';
 export type { LightRow, MarkEntry } from './wire.js';
 export { failureSig, normalizeErrorText } from './sig.js';
@@ -199,6 +200,11 @@ export interface AgentReport {
     }[];
     /** 待人工批准（**有效状态** === 'proposed'）的提案数 —— 只报数，不自动执行 */
     readonly pendingProposals: number;
+    /**
+     * L5 跨会话聚合（只在 `crossSessions` 参数下出现）：最近 N 个会话的汇总 + 跨会话复现的失败签名。
+     * 缺省字段不存在 —— 没请求就不说，避免报告里出现一堆无关的空壳。
+     */
+    readonly crossSessions?: CrossSessions;
     readonly context: {
         lastTurn?: number;
         lastContextBytes?: number;
@@ -286,4 +292,9 @@ export declare function buildAgentReport(input: {
      * 所以聚合别的运行（或单测里造数据）必须显式指定它，否则会被当成历史片段。
      */
     runId?: string;
+    /**
+     * L5 跨会话聚合结果（由宿主侧 `cross.collectCrossSessions` 算好传入 —— 本函数保持纯函数，
+     * 不做任何 IO）。缺省 = 本次没有请求跨会话聚合，报告里就不出现 `crossSessions` 字段。
+     */
+    cross?: CrossSessions;
 }): AgentReport;

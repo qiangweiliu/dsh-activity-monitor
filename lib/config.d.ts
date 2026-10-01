@@ -27,6 +27,11 @@ export interface AMConfig {
     };
     /** marks 日志的容量（超过后最旧的标记被丢弃，客户端会用 tooOld 触发整段重载） */
     markLogCap: number;
+    /**
+     * 跨会话聚合（L5）默认统计多少个会话；`activity_report` 的 `crossSessions` 参数可覆盖（上限 50）。
+     * 只取最近 N 个会话：全库聚合对「最近在哪类任务上反复低效」没有增益，却要付全部 IO。
+     */
+    crossSessionLimit: number;
     /** 是否注册 HTTP 端点（关掉 = 只采集不暴露） */
     endpoints: boolean;
     /** 配置里被忽略/被修正的项（失败软着陆的可观测出口） */

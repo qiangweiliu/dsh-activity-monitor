@@ -237,3 +237,95 @@ export function effectiveProposalStatus(
   }
   return out
 }
+
+// ── L5 跨会话聚合（纯函数层） ──
+// 口径纪律：这里的轮数/token/工具频次**复用 sessionTotals**，不另写一套 ——
+// 两套算法一旦漂移，面板与会话间对比就会互相打脸。
+
+/** 单个会话的汇总（跨会话对比的单元） */
+export interface SessionSummary {
+  sessionId: string | null
+  /** 该会话落盘的行数（含 llm/tool/verdict/proposal 所有 kind） */
+  rows: number
+  firstTs: number
+  lastTs: number
+  turns: number
+  llmCalls: number
+  toolCalls: number
+  failedCalls: number
+  inputTokens: number
+  outputTokens: number
+  maxContextBytes: number
+  /** 用得最多的 3 个工具 */
+  topTools: { name: string; count: number }[]
+  /** 该会话内按签名聚合的失败（次数降序；同签名多次算一次聚合） */
+  failSigs: { sig: string; count: number }[]
+  /** 复现最多的失败签名（没有失败时为 null，不编一个空签名出来） */
+  topFailSig: { sig: string; count: number } | null
+}
+
+/**
+ * 汇总一个会话的行。
+ * @param rows - 该会话的全部行
+ * @param sessionId - 会话 id（global.jsonl 为 null）
+ */
+export function summarizeSession(rows: DerivedRow[], sessionId: string | null = null): SessionSummary {
+  const t = sessionTotals(rows)
+  const bySig = new Map<string, number>()
+  let firstTs = 0
+  let lastTs = 0
+  for (const r of rows) {
+    // 手写 min/max 而不是 Math.min(...ts)：大数组展开会把调用栈打爆
+    if (firstTs === 0 || r.ts < firstTs) firstTs = r.ts
+    if (r.ts > lastTs) lastTs = r.ts
+    if (r.ok === false && r.failSig) bySig.set(r.failSig, (bySig.get(r.failSig) ?? 0) + 1)
+  }
+  const failSigs = [...bySig.entries()]
+    .map(([sig, count]) => ({ sig, count }))
+    .sort((a, b) => (b.count - a.count) || a.sig.localeCompare(b.sig))
+  return {
+    sessionId,
+    rows: rows.length,
+    firstTs,
+    lastTs,
+    turns: t.turns,
+    llmCalls: t.llmCalls,
+    toolCalls: t.toolCalls,
+    failedCalls: t.failedCalls,
+    inputTokens: t.inputTokens,
+    outputTokens: t.outputTokens,
+    maxContextBytes: t.maxContextBytes,
+    topTools: t.toolFrequency.slice(0, 3),
+    failSigs,
+    topFailSig: failSigs[0] ?? null,
+  }
+}
+
+/**
+ * 跨会话复现的失败签名：出现在 **≥ minSessions 个不同会话** 的签名。
+ *
+ * 这是「在哪类任务上反复低效」的直接输入：只在单个会话里炸过的签名是偶发，
+ * 跨会话复现才说明是可学的模式（对应 §5 的聚类口径）。
+ * 注意 counts：同一会话里同一签名出现 10 次，只让 sessions +1，failures +10。
+ *
+ * @param summaries - 各会话汇总
+ * @param minSessions - 至少出现在几个会话里（缺省 2）
+ */
+export function recurringFailSigs(
+  summaries: SessionSummary[],
+  minSessions = 2,
+): { sig: string; sessions: number; failures: number }[] {
+  const bySig = new Map<string, { sessions: number; failures: number }>()
+  for (const s of summaries) {
+    for (const f of s.failSigs) {
+      const cur = bySig.get(f.sig) ?? { sessions: 0, failures: 0 }
+      cur.sessions += 1
+      cur.failures += f.count
+      bySig.set(f.sig, cur)
+    }
+  }
+  return [...bySig.entries()]
+    .map(([sig, v]) => ({ sig, sessions: v.sessions, failures: v.failures }))
+    .filter((x) => x.sessions >= minSessions)
+    .sort((a, b) => (b.sessions - a.sessions) || (b.failures - a.failures) || a.sig.localeCompare(b.sig))
+}

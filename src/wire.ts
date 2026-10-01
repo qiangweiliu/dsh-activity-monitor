@@ -233,3 +233,17 @@ export class MarkLog {
     }
   }
 }
+
+/**
+ * 合并内存行 + 历史行（按 `seq:ts` 去重，**内存优先** —— 内存是更新版本）。
+ *
+ * 为什么不能只看 seq：seq 是每进程计数器，历史文件里重启前的行会与本次运行的行 seq 数值重叠，
+ * 按 seq 去重会误删；`seq:ts` 才是行的真实身份。宿主（activity_report / 跨会话聚合）与单测共用这一条规则。
+ */
+export function mergeActivityRows<T extends { seq: number; ts: number }>(mem: T[], hist: T[]): T[] {
+  const key = (r: { seq: number; ts: number }): string => `${r.seq}:${r.ts}`
+  const m = new Map<string, T>()
+  for (const r of hist) m.set(key(r), r)
+  for (const r of mem) m.set(key(r), r)
+  return [...m.values()].sort((a, b) => (a.ts - b.ts) || (a.seq - b.seq))
+}

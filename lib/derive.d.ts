@@ -116,3 +116,54 @@ export declare function effectiveProposalStatus(rows: {
     seq: number;
     by: string;
 }>;
+/** 单个会话的汇总（跨会话对比的单元） */
+export interface SessionSummary {
+    sessionId: string | null;
+    /** 该会话落盘的行数（含 llm/tool/verdict/proposal 所有 kind） */
+    rows: number;
+    firstTs: number;
+    lastTs: number;
+    turns: number;
+    llmCalls: number;
+    toolCalls: number;
+    failedCalls: number;
+    inputTokens: number;
+    outputTokens: number;
+    maxContextBytes: number;
+    /** 用得最多的 3 个工具 */
+    topTools: {
+        name: string;
+        count: number;
+    }[];
+    /** 该会话内按签名聚合的失败（次数降序；同签名多次算一次聚合） */
+    failSigs: {
+        sig: string;
+        count: number;
+    }[];
+    /** 复现最多的失败签名（没有失败时为 null，不编一个空签名出来） */
+    topFailSig: {
+        sig: string;
+        count: number;
+    } | null;
+}
+/**
+ * 汇总一个会话的行。
+ * @param rows - 该会话的全部行
+ * @param sessionId - 会话 id（global.jsonl 为 null）
+ */
+export declare function summarizeSession(rows: DerivedRow[], sessionId?: string | null): SessionSummary;
+/**
+ * 跨会话复现的失败签名：出现在 **≥ minSessions 个不同会话** 的签名。
+ *
+ * 这是「在哪类任务上反复低效」的直接输入：只在单个会话里炸过的签名是偶发，
+ * 跨会话复现才说明是可学的模式（对应 §5 的聚类口径）。
+ * 注意 counts：同一会话里同一签名出现 10 次，只让 sessions +1，failures +10。
+ *
+ * @param summaries - 各会话汇总
+ * @param minSessions - 至少出现在几个会话里（缺省 2）
+ */
+export declare function recurringFailSigs(summaries: SessionSummary[], minSessions?: number): {
+    sig: string;
+    sessions: number;
+    failures: number;
+}[];
