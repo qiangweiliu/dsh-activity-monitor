@@ -1,6 +1,34 @@
 # dsh-activity-monitor
 dsh运行状态监控插件
 
+## 安装（git 安装面，实测于 pnpm 12.6.0 / dsh 0.1.5-rc.3）
+
+```bash
+# 1) 放行这个 git 依赖执行构建脚本（每个新 commit 一次，原因见下）
+#    dsh 首次 add 失败时会打印需要加的**精确键**，照抄进 profile 的 pnpm-workspace.yaml：
+#    allowBuilds:
+#      'dsh-activity-monitor@https://codeload.github.com/qiangweiliu/dsh-activity-monitor/tar.gz/<sha>': true
+# 2) 安装
+dsh plugin --profile <profile> add github:qiangweiliu/dsh-activity-monitor
+# 3) 重启这个 profile 的 dsh（新增 loader 条目必须重启；热生效的只有 disabled / patch 表达式的变更）
+```
+
+为什么需要第 1 步：pnpm 12 默认拒绝对依赖执行构建脚本，而本包用 `prepare` 在安装期核对产物
+（有工具链时**就地重新编译**，没有工具链时校验仓库里已提交的 `lib/`，两者都以非零退出码拦住漏项）。
+
+实测（0.6.1）：pnpm 从 codeload 拉**该 commit 的 tarball** → 临时目录里 `npm install` + `prepare`
+（安装日志里可见 `client bundle written: lib/client.js`，即真的重编译了一遍）→ 按 `files` 白名单装进 profile。
+装出来的包：`lib/` 17 个产物齐全（含 `cross.js`）、**不含**构建中间产物（`client.raw.js`）与冒烟脚本、运行时依赖 **0** 个；
+重启后三个工具与全部端点照常（`/registered-tools` 115 个、`POST /proposal` 的 404/405/415 守卫如期应答）。
+
+开发时用本地路径安装更省事（`link:` 不需要放行，改完 `npm run build` 即生效）：
+
+```bash
+dsh plugin --profile <profile> add /path/to/dsh-activity-monitor
+```
+
+升级坑：`allowBuilds` 的键**含 commit sha**，换 commit 后旧键不再匹配 —— 按 dsh 打印的新键重加即可。
+
 ## agent 侧工具（自我进化的结果数据）
 
 本插件在 `tools` 服务就绪时懒注册三个工具（没有 tools 服务的部署里监控核心照常跑，只是不暴露工具）：

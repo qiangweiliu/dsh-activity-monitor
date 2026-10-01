@@ -5,6 +5,17 @@
 
 ## [0.6.1] - 2026-10-01
 
+### 文档（git 安装面实跑后补齐）
+
+- README 补「安装」章节：`dsh plugin add github:…` 在 **pnpm 12** 下会先失败一次 ——
+  `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`（pnpm 默认拒绝对依赖跑构建脚本，本包要用 `prepare` 核对产物）。
+  修法是把 dsh 打印的精确键（含 commit sha）加进 profile 的 `pnpm-workspace.yaml` 的 `allowBuilds`，再重跑。
+- 实跑事实：pnpm 拉该 commit 的 tarball → 临时目录 `npm install` + `prepare`（**就地重编译**，日志见
+  `client bundle written: lib/client.js`）→ 按 `files` 装进 profile；装出来的 `lib/` 17 个产物齐全、
+  无中间产物/冒烟脚本、运行时依赖 0 个；重启后三工具与全部端点照常（含 `POST /proposal` 的 404/405/415 守卫）。
+- 本地开发仍推荐路径安装（`link:`，不需要放行、build 即生效）。
+
+
 ### 修复（冒烟断言依赖真实数据目录，CI 上必挂）
 
 - `smoke-tools` 原先跑在**用户真实历史目录**里，L5 的缓存断言（第二次命中 / 复用数）只有在磁盘上
